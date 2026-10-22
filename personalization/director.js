@@ -25,7 +25,9 @@
    Speed, spacing and ramp go easier than Classic only for
    players flagged as struggling (see profile.isStruggling),
    who are also the only ones offered rescue कवच gates.
-   Seeta refills are offered sparingly (see SEETA); storms a
+   A personal-best governor stops easing and pushes hard once
+   a run's score passes the player's median, so new bests stay
+   rare. Seeta refills are offered sparingly (see SEETA); storms a
    player clears with Shakti are classified as imminent
    threats (tension, like a near miss) or far clears.
    ========================================================= */
@@ -33,7 +35,7 @@
 import { createStorage, SCHEMA_VERSION } from './storage.js';
 import { createRecorder } from './recorder.js';
 import {
-  defaultProfile, createProfileTracker, weakSide, heatCellCenter, isStruggling, engagement, shaktiStyle, BOUNDS,
+  defaultProfile, createProfileTracker, weakSide, heatCellCenter, isStruggling, engagement, shaktiStyle, scoreMedian, BOUNDS,
 } from './profile.js';
 import { defaultRisk, riskFeatures, predictRisk, updateRisk } from './models/risk.js';
 import { ARMS, defaultBandit, updateBandit, chooseArm, banditMean } from './models/bandit.js';
@@ -80,6 +82,9 @@ const RESCUE = { interval: 30, shield: 40 }; // s of run time per rescue gate; s
 // the base refill rate (no extra refills for struggling) and ease via threat-clear tension.
 const SEETA = { cooldown: 30, convenienceSlower: 3 };
 const CONVENIENCE_PUSH = 1.5;
+// Personal-best governor (see governor()): full strength at `nearBest` × the best score;
+// `err` is the tension error it imposes at full strength (saturates every knob).
+const GOVERNOR = { nearBest: 0.8, err: 0.2 };
 // Rings: `pass` mirrors main.js (a ring counts when the ship is within 2.1 of its centre).
 // While personalising, no ring is placed within `minOffset` of the ship, so collecting one
 // always takes a deliberate move.
@@ -144,6 +149,8 @@ export function createDirector({
   let lastSeetaAt = 0;     // run time of the last offered Seeta ring (0: none before the cooldown)
   let seetaPending = false; // an offered Seeta ring is still in flight
   let style = 'unknown';   // Shakti style, frozen at run start
+  let runScore = 0;        // this run's score so far (from tick ctx.score), for the governor
+  const govBoost = { speedMul: 0, riskMul: 0, gapMul: 0 }; // governor overlay, this run only
   let clock = 0;           // run time as seen by the director
   let sampleTimer = 0;
   let nextWaveId = 1;
@@ -227,22 +234,48 @@ export function createDirector({
 
   // A knob's step this frame as a share of its easing rate limit, signed toward "harder":
   // in [-1, PUSH_SHARE]. Both the controller and the skill update use it.
-  function push(key, err) {
+  function push(key, err, g = 0) {
     const { gain, rate } = CONTROL[key];
     const p = clamp(Math.abs(gain) * err / rate, [-1, 1]);
-    return p > 0 ? p * PUSH_SHARE * (style === 'convenience' ? CONVENIENCE_PUSH : 1) : p;
+    const share = lerp(PUSH_SHARE * (style === 'convenience' ? CONVENIENCE_PUSH : 1), 1, g);
+    return p > 0 ? p * share : p;
   }
 
+  // Personal-best governor, 0…1: 0 until this run's score passes the player's median Adaptive
+  // score, rising to 1 at GOVERNOR.nearBest × their best. While it is above 0 the director never
+  // eases (the brake and calm are overridden) and offers no rings; at 1 it pushes at the full
+  // rate. A new best stays possible, but only against the hardest version of the game.
+  function governor() {
+    if (confidence <= 0 || !run) return 0;
+    const med = scoreMedian(model.profile);
+    if (med === null || runScore <= med) return 0;
+    const top = Math.max(GOVERNOR.nearBest * model.profile.bestScore, med * 1.05);
+    return clamp((runScore - med) / (top - med), [0, 1]);
+  }
+
+  // The learned (saved) knobs step as usual, except that while the governor is on they never
+  // ease. The governor's own push goes into a per-run overlay (govBoost) that is never saved
+  // and resets at run start, so a strong run does not make the next one harder.
   function stepController(dt) {
-    const err = D().targetTension - felt();
+    const g = governor();
+    const raw = D().targetTension - felt();
+    const err = g > 0 ? Math.max(raw, 0) : raw;
     for (const key of Object.keys(CONTROL)) {
       const { gain, rate } = CONTROL[key];
       D()[key] = clamp(D()[key] + Math.sign(gain) * push(key, err) * rate * dt, limit(key));
+      if (g > 0) {
+        const extra = Math.sign(gain) * push(key, g * GOVERNOR.err, 1) * rate * dt;
+        govBoost[key] = clamp(D()[key] + govBoost[key] + extra, limit(key)) - D()[key];
+      }
     }
   }
 
+  // A knob's value in play: the learned value plus this run's governor overlay.
+  const knob = (key) => clamp(D()[key] + govBoost[key], limit(key));
+
   // How hard the controller is pushing toward "harder", averaged over knobs. Skill learns
   // from this, so a brief brake spike weighs no more than it does in the controller.
+  // The governor's push is left out: it caps scores, it is not evidence about the player.
   function drive() {
     const err = D().targetTension - felt();
     const keys = Object.keys(CONTROL);
@@ -291,6 +324,7 @@ export function createDirector({
     get struggling() { return struggling; },
     get seetaPending() { return seetaPending; },
     get shaktiStyle() { return style; },
+    get governor() { return governor(); },
     // This run's Shakti clears so far: { threat, far }.
     get runClears() { return { threat: run?.clearedThreat ?? 0, far: run?.clearedFar ?? 0 }; },
     get felt() { return felt(); },
@@ -310,7 +344,7 @@ export function createDirector({
         // Relative target: the classic mix tilted to riskMul × its own expected hit rate.
         const mix = classicArmWeights(ctx.runTime, d);
         const classicHitRate = allowed.reduce((s, a) => s + mix[a] * banditMean(model.bandit[a]), 0);
-        arm = chooseArm(model.bandit, mix, classicHitRate * D().riskMul, allowed, rng);
+        arm = chooseArm(model.bandit, mix, classicHitRate * knob('riskMul'), allowed, rng);
       } else {
         // Today's spawnWave() selection, unchanged.
         const r = rng();
@@ -338,7 +372,7 @@ export function createDirector({
         personal = true;
         // Aim at the classic proposal's risk scaled by riskMul (±5% jitter). The classic spot
         // is the fallback, and no candidate below the floor is ever taken.
-        goal = classicRisk * D().riskMul * (1 + (rng() - 0.5) * 0.1);
+        goal = classicRisk * knob('riskMul') * (1 + (rng() - 0.5) * 0.1);
         const floor = LIMITS.riskMul[0] * classicRisk;
         let bestGap = Math.abs(classicRisk - goal);
         // Half the candidates slide the classic spot along the line from the predicted ship
@@ -373,8 +407,8 @@ export function createDirector({
       };
       const classicRisk = riskOf([...ctx.gaps]);
       let best = ctx.gaps, bestRisk = classicRisk, goal = classicRisk;
-      if (D().riskMul > 1) {
-        goal = classicRisk * D().riskMul;
+      if (knob('riskMul') > 1) {
+        goal = classicRisk * knob('riskMul');
         const floor = LIMITS.riskMul[0] * classicRisk;
         let bestGap = Math.abs(classicRisk - goal);
         ctx.cols.forEach((_, i) => {
@@ -393,7 +427,7 @@ export function createDirector({
     // - 'ram' (rescue कवच): players flagged as struggling, shield low, ≤ 1 per RESCUE.interval s.
     // - 'seeta' (refill): 0 charges, none already in flight, ≥ SEETA.cooldown s since the last.
     shouldOfferRing(ctx) {
-      if (confidence <= 0) return null;
+      if (confidence <= 0 || governor() > 0) return null; // no gifts while chasing a best
       if (struggling && ctx.shield <= RESCUE.shield && ctx.runTime - lastRescueAt >= RESCUE.interval) {
         lastRescueAt = ctx.runTime;
         return 'ram';
@@ -447,8 +481,8 @@ export function createDirector({
       };
     },
 
-    speedMultiplier() { return lerp(CLASSIC.speedMul, D().speedMul, confidence); },
-    spawnGapMultiplier() { return lerp(CLASSIC.gapMul, D().gapMul, confidence); },
+    speedMultiplier() { return lerp(CLASSIC.speedMul, knob('speedMul'), confidence); },
+    spawnGapMultiplier() { return lerp(CLASSIC.gapMul, knob('gapMul'), confidence); },
     personalRamp(runTime) {
       const skill = lerp(CLASSIC.skill, D().skill, confidence);
       return Math.min(1, runTime * skill / CLASSIC.rampSeconds);
@@ -482,6 +516,7 @@ export function createDirector({
     tick(dt, ctx) {
       if (!ctx.playing) return;
       clock += dt;
+      if (ctx.score !== undefined) runScore = ctx.score;
       tension *= Math.exp(-TENSION.decay * dt);
       brake = Math.max(0, brake - dt);
       // Hold the controller until obstacles actually reach the player this run: the empty
@@ -518,6 +553,8 @@ export function createDirector({
         style = confidence > 0 ? shaktiStyle(model.profile) : 'unknown';
         lastRescueAt = 0;
         lastSeetaAt = 0;
+        runScore = 0;
+        for (const key of Object.keys(govBoost)) govBoost[key] = 0;
         seetaPending = false;
         // A player no longer struggling loses any below-Classic easing learned meanwhile.
         if (learning()) for (const key of ['speedMul', 'gapMul', 'skill', 'riskMul']) D()[key] = clamp(D()[key], limit(key));
@@ -596,6 +633,8 @@ export function createDirector({
       confidence = 0;
       tension = 0;
       brake = 0;
+      runScore = 0;
+      for (const key of Object.keys(govBoost)) govBoost[key] = 0;
       waves.clear();
       decisions.length = 0;
     },

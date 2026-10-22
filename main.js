@@ -1833,7 +1833,8 @@ function frame() {
 
   if (state.mode === 'playing') {
     state.dist += dz;
-    state.score += dz * 0.1;
+    // Distance scores at Classic speed: being pushed faster makes the game harder, not richer.
+    state.score += (dz / director.speedMultiplier()) * 0.1;
     if (state.dist >= state.nextSpawn) {
       spawnWave();
       state.nextSpawn = state.dist + THREE.MathUtils.lerp(70, 34, difficulty()) * director.spawnGapMultiplier();
@@ -1844,7 +1845,7 @@ function frame() {
   updateScenery(dt, dz);
   updateShip(dt, t);
   updateEntities(dt, dz, t);
-  director.tick(dt, { playing: state.mode === 'playing', ship: shipCtx(), target, boost: input.boost });
+  director.tick(dt, { playing: state.mode === 'playing', ship: shipCtx(), target, boost: input.boost, score: state.score });
   debugOverlay.update(dt);
   updateParticles(dt, dz);
   updateStreaks(dz);

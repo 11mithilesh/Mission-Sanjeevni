@@ -50,6 +50,8 @@ export function defaultProfile() {
     // Last RUN_HISTORY run durations (s), newest first; 0 = no run yet. Fixed length so
     // storage's type check keeps it.
     recentRuns: new Array(RUN_HISTORY).fill(0),
+    recentScores: new Array(RUN_HISTORY).fill(0), // final scores, same layout as recentRuns
+    bestScore: 0,            // best Adaptive score seen by the director
     boost: 0.1,              // fraction of time spent boosting
     activity: ACTIVE.share,  // fraction of time the ship is moving (steering engagement)
     shaktiThreat: 3,         // obstacles on screen when Shakti is used
@@ -84,13 +86,23 @@ export function heatCellCenter(index) {
 // +1 → obstacles to the player's right are harder to dodge, −1 → left.
 export const weakSide = (p) => Math.tanh(4 * (p.hitRight - p.hitLeft));
 
+const median = (xs) => {
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+};
+
 export function isStruggling(p) {
   const runs = p.recentRuns.filter((d) => d > 0);
   if (runs.length < STRUGGLE.minRuns) return false;
-  const sorted = [...runs].sort((a, b) => a - b);
-  const mid = sorted.length >> 1;
-  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-  return runs.slice(0, STRUGGLE.recent).every((d) => d < STRUGGLE.share * median);
+  return runs.slice(0, STRUGGLE.recent).every((d) => d < STRUGGLE.share * median(runs));
+}
+
+// Median of the recorded Adaptive scores (null until GOVERNOR_MIN_RUNS are recorded).
+export const GOVERNOR_MIN_RUNS = 5;
+export function scoreMedian(p) {
+  const scores = p.recentScores.filter((s) => s > 0);
+  return scores.length < GOVERNOR_MIN_RUNS ? null : median(scores);
 }
 
 // Occupancy-weighted mean position: where the player tends to sit.
@@ -122,6 +134,9 @@ export function createProfileTracker(profile) {
           p.runLength = ewma(p.runLength, e.duration, p.runs === 1 ? 0.5 : 0.2);
           p.recentRuns.pop();
           p.recentRuns.unshift(Math.max(e.duration, 0.001));
+          p.recentScores.pop();
+          p.recentScores.unshift(Math.max(e.score ?? 0, 0));
+          p.bestScore = Math.max(p.bestScore, e.score ?? 0);
           p.shaktiPerMin = ewma(p.shaktiPerMin, runShakti / Math.max(e.duration / 60, 0.25), 0.2);
           break;
         case 'wave_spawn':

@@ -408,6 +408,49 @@ test('rings never land on a ship that is not moving (any learned reach, classic 
   }
 });
 
+test('personal-best governor: off below the median, full at 0.8 × best; no easing, no rings', () => {
+  const trained = defaultModel();
+  trained.profile.observations = 10000;
+  trained.profile.recentScores = [...new Array(10).fill(1000), ...new Array(5).fill(0)];
+  trained.profile.bestScore = 2000;
+  trained.profile.recentRuns = new Array(15).fill(60);
+  const director = makeDirector({ model: trained });
+  director.onEvent({ type: 'run_start' });
+  const tick = (score, n = 1) => {
+    for (let i = 0; i < n; i++) director.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false, score });
+  };
+  tick(900);
+  assert.equal(director.governor, 0, 'below the median');
+  tick(1300);
+  assert.ok(Math.abs(director.governor - 0.5) < 1e-9, 'halfway from median to 0.8 × best');
+  tick(1700);
+  assert.equal(director.governor, 1);
+
+  // A hit would normally brake (ease); with the governor at 1 play gets harder instead.
+  director.onEvent({ type: 'obstacle_pass', outcome: 'hit', features: [1, 0.1, 0.1, 0, 0.2, 1, 0, 0.1] });
+  const before = { ...director.model.director };
+  const speedBefore = director.speedMultiplier();
+  tick(1700, 60);
+  assert.ok(director.speedMultiplier() > speedBefore, 'pushes despite the brake');
+  assert.ok(director.model.director.speedMul >= before.speedMul, 'learned values never ease meanwhile');
+  assert.equal(director.model.director.riskMul, before.riskMul);
+  // …and offers no rescue or refill rings.
+  for (let t = 30; t < 200; t += 5) {
+    assert.equal(director.chooseWave({ runTime: t, shield: 10, powerCharges: 0, obstacles: 12 }).offered, false);
+  }
+  // The push is this run's only: the next run starts from the learned values.
+  director.onEvent({ type: 'run_end', duration: 60, score: 1700, cause: 'shield' });
+  director.onEvent({ type: 'run_start' });
+  assert.equal(director.speedMultiplier(), director.model.director.speedMul);
+  assert.equal(director.governor, 0);
+
+  // No history yet: no governor.
+  const fresh = makeDirector({ model: { ...defaultModel(), profile: { ...defaultModel().profile, observations: 10000 } } });
+  fresh.onEvent({ type: 'run_start' });
+  fresh.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false, score: 1e6 });
+  assert.equal(fresh.governor, 0);
+});
+
 test('reset forgets everything but keeps the classic preference', () => {
   const trained = defaultModel();
   trained.profile.observations = 999;
