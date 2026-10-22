@@ -2,7 +2,7 @@
    Headless simulation: bot players vs. the director.
    Mirrors main.js gameplay (speeds, spawn spacing, wave shapes,
    collision ellipsoids, shield/invulnerability, gates) without
-   Three.js. Run: node tests/sim.mjs  (seeds 0–4; exit code 1 on any
+   Three.js. Run: node tests/sim.mjs  (checks A–H on seeds 0–4; exit code 1 on any
    failed check; SIM_SEED shifts the seeds, SIM_VERBOSE=1 prints runs)
    ========================================================= */
 
@@ -87,6 +87,11 @@ function createBot(skill, rng) {
   };
 }
 
+// A player who never steers: the ship stays where each run starts. Never quits.
+function createIdleBot() {
+  return { skill: 'idle', quits: () => false, reset() {}, steer() {} };
+}
+
 // ---------- Guardrails: every clamped value, checked every tick ----------
 const EPS = 1e-9;
 function guard(violations, name, value, [lo, hi]) {
@@ -115,6 +120,8 @@ function playRun(director, bot, rng) {
   const calibration = [];        // [predicted risk at placement, hit?] per resolved obstacle
   const violations = [];
   let nearMisses = 0;
+  let tensionSum = 0, brakeTime = 0;
+  let stormRisk = 0, stormClassicRisk = 0; // placed vs. classic-proposal risk, summed over storms
   let hits = 0, passes = 0, riskSum = 0, riskTime = 0, waves = { wall: 0, scatter: 0, snake: 0, gate: 0 };
 
   bot.reset(); // world time restarts at 0 each run
@@ -126,6 +133,7 @@ function playRun(director, bot, rng) {
   const crystal = (wave, x, y, z, s, sy, xRange = null, yRange = null, count = 1) => {
     const p = director.placeObstacle({ waveId: wave.id, x, y, z, s, sy, xRange, yRange, count, fixed: !xRange, ship: shipCtx(), speed: world.speed });
     wavePredicted.set(wave.id, 1 - (1 - (wavePredicted.get(wave.id) ?? 0)) * (1 - p.risk));
+    stormRisk += p.risk; stormClassicRisk += p.classicRisk;
     world.entities.push({
       type: 'crystal', x: p.x, y: p.y, z: p.z, rx: 1.9 * p.s, ry: 1.1 * p.s * p.sy,
       passed: false, waveId: wave.id, features: p.features, side: p.side, theme, risk: p.risk,
@@ -236,6 +244,7 @@ function playRun(director, bot, rng) {
 
     director.tick(DT, { playing: true, ship: world.ship, target: world.target, boost: false });
     if (director.confidence > 0) { riskSum += director.model.director.riskMul * DT; riskTime += DT; }
+    tensionSum += director.tension * DT; brakeTime += director.brake > 0 ? DT : 0;
     checkGuardrails(director, st.runTime, violations);
   }
 
@@ -247,12 +256,13 @@ function playRun(director, bot, rng) {
   // Storm-carrying waves that reached the player: realised hit vs. predicted wave risk at placement.
   const faced = [...waveStats].filter(([id]) => wavePredicted.has(id));
   return {
-    duration, cause, hits, passes, nearMisses, waves, calibration, violations,
+    duration, cause, hits, passes, nearMisses, waves, calibration, violations, stormRisk, stormClassicRisk,
     waveHits: [...waveStats.values()].filter(Boolean).length, wavesFaced: waveStats.size,
     targetedWaves: faced.length,
     targetedHits: faced.filter(([, hit]) => hit).length,
     targetedRiskSum: faced.reduce((s, [id]) => s + wavePredicted.get(id), 0),
     riskMul: riskTime ? riskSum / riskTime : null,
+    meanTension: tensionSum / Math.max(st.runTime, DT), brakeShare: brakeTime / Math.max(st.runTime, DT),
     speedMul: director.speedMultiplier(), rawSpeedMul: m.speedMul, gapMul: m.gapMul,
     skill: m.skill, targetTension: m.targetTension, confidence: director.confidence,
   };
@@ -269,7 +279,7 @@ function runBot(skill, seed, { classic = false } = {}) {
   let sessions = 1;
   let director = newDirector(sessions);
   if (classic) director.setClassic(true); // saved, so later sessions load it too
-  const bot = createBot(skill, seeded(seed + 2000));
+  const bot = skill === 'idle' ? createIdleBot() : createBot(skill, seeded(seed + 2000));
   const runs = [];
   for (let i = 0; i < RUNS; i++) {
     const run = playRun(director, bot, rng);
@@ -296,6 +306,9 @@ const spread = (lengths) => {
 
 // ---------- Acceptance thresholds ----------
 const BOTS = [[0.2, 11], [0.5, 22], [0.9, 33]];
+const IDLE = ['idle', 44];       // E: a bot that never steers
+// Adaptive ÷ Classic mean run length (last TAIL runs), and minimum storm-risk ratio.
+const RATIO = { idleMax: 1.1, capableMax: 1.2, weakMin: 1.0, weakMax: 2.0, stormRiskMin: 0.7 };
 const BASE_SEED = Number(process.env.SIM_SEED || 0);
 const SEEDS = [0, 1, 2, 3, 4].map((s) => BASE_SEED + s);
 const VERBOSE = process.env.SIM_VERBOSE === '1';
@@ -334,17 +347,18 @@ function summarise(skill, { runs, sessions }) {
     lenFirst10: mean(runs.slice(0, 10).map((r) => r.duration)),
     lenLast10: mean(runs.slice(-10).map((r) => r.duration)),
     lenTail: mean(tail.map((r) => r.duration)),
+    stormRiskRatio: sum(tail, (r) => r.stormRisk) / Math.max(sum(tail, (r) => r.stormClassicRisk), 1e-12),
     violations: runs.flatMap((r) => r.violations),
     last: runs[runs.length - 1],
   };
 }
 
-function printRuns(res) {
-  console.log(`\n  Bot skill ${res.skill}  (${res.sessions} sessions)`);
-  console.log('    run  len(s)  waveHits/waves  hits/near/passes     riskMul  speed×  gap×  skill  targetTension  conf');
+function printRuns(res, label) {
+  console.log(`\n  ${label}: bot skill ${res.skill}  (${res.sessions} sessions)`);
+  console.log('    run  len(s)  waveHits/waves  hits/near/passes     riskMul  speed×  gap×  skill  targetTension  tension  braked  conf');
   res.runs.forEach((r, i) => {
     if (i < 5 || i % 5 === 4) {
-      console.log(`    ${String(i + 1).padStart(3)}  ${f(r.duration, 0).padStart(6)}${r.quit ? 'q' : ' '} ${`${r.waveHits}/${r.wavesFaced}`.padStart(14)}  ${`${r.hits}/${r.nearMisses}/${r.passes}`.padStart(16)}  ${f(r.riskMul).padStart(10)}  ${f(r.speedMul).padStart(6)}  ${f(r.gapMul).padStart(4)}  ${f(r.skill).padStart(5)}  ${f(r.targetTension).padStart(13)}  ${f(r.confidence)}`);
+      console.log(`    ${String(i + 1).padStart(3)}  ${f(r.duration, 0).padStart(6)}${r.quit ? 'q' : ' '} ${`${r.waveHits}/${r.wavesFaced}`.padStart(14)}  ${`${r.hits}/${r.nearMisses}/${r.passes}`.padStart(16)}  ${f(r.riskMul).padStart(10)}  ${f(r.speedMul).padStart(6)}  ${f(r.gapMul).padStart(4)}  ${f(r.skill).padStart(5)}  ${f(r.targetTension).padStart(13)}  ${f(r.meanTension).padStart(7)}  ${f(r.brakeShare).padStart(6)}  ${f(r.confidence)}`);
     }
   });
 }
@@ -354,15 +368,21 @@ const overview = []; // [seed, check, ok]
 for (const seed of SEEDS) {
   const personal = BOTS.map(([skill, s]) => summarise(skill, runBot(skill, s + seed)));
   const classic = BOTS.map(([skill, s]) => summarise(skill, runBot(skill, s + seed, { classic: true })));
+  const idle = summarise(IDLE[0], runBot(IDLE[0], IDLE[1] + seed));
+  const idleClassic = summarise(IDLE[0], runBot(IDLE[0], IDLE[1] + seed, { classic: true }));
   const checks = [];
   const check = (id, label, ok) => { checks.push([id, label, ok]); overview.push([seed, id, ok]); };
 
   console.log(`\n================ SEED ${seed} ================`);
-  if (VERBOSE) personal.forEach(printRuns);
+  if (VERBOSE) {
+    [...personal, idle].forEach((r) => printRuns(r, 'Adaptive'));
+    [...classic, idleClassic].forEach((r) => printRuns(r, 'Classic'));
+  }
 
-  console.log(`  bot  realised  predicted  waves   len first10→last10  len(last ${TAIL}) personal / classic  skill  speed×`);
-  personal.forEach((r, i) => {
-    console.log(`  ${r.skill.toFixed(1)}  ${f(r.realised, 3).padStart(8)}  ${f(r.target, 3).padStart(9)}  ${String(r.targetedWaves).padStart(5)}  ${`${f(r.lenFirst10, 0)} → ${f(r.lenLast10, 0)}`.padStart(19)}  ${`${f(r.lenTail, 0)} / ${f(classic[i].lenTail, 0)}`.padStart(28)}  ${f(r.last.skill).padStart(5)}  ${f(r.last.speedMul).padStart(6)}`);
+  console.log(`  bot   realised  predicted  waves   len first10→last10  len(last ${TAIL}) adaptive / classic  ratio  storm risk×  skill  speed×`);
+  [...personal, idle].forEach((r, i) => {
+    const c = i < personal.length ? classic[i] : idleClassic;
+    console.log(`  ${String(r.skill).padEnd(4)}  ${f(r.realised, 3).padStart(8)}  ${f(r.target, 3).padStart(9)}  ${String(r.targetedWaves).padStart(5)}  ${`${f(r.lenFirst10, 0)} → ${f(r.lenLast10, 0)}`.padStart(19)}  ${`${f(r.lenTail, 0)} / ${f(c.lenTail, 0)}`.padStart(28)}  ${f(r.lenTail / c.lenTail).padStart(5)}  ${f(r.stormRiskRatio).padStart(11)}  ${f(r.last.skill).padStart(5)}  ${f(r.last.speedMul).padStart(6)}`);
   });
 
   // A. Realised wave hit rate tracks the wave risk predicted when the waves were placed.
@@ -391,9 +411,26 @@ for (const seed of SEEDS) {
   check('C', `run-length spread across bots (CV) ${f(sp)} < classic ${f(sc)}`, sp < sc);
 
   // D. Guardrail clamps never exceeded (personalised and classic runs, every tick).
-  for (const [label, set] of [['personal', personal], ['classic', classic]]) {
+  for (const [label, set] of [['personal', [...personal, idle]], ['classic', [...classic, idleClassic]]]) {
     const v = set.flatMap((r) => r.violations);
     check('D', `${label}: guardrail clamps never exceeded${v.length ? ` (${v.slice(0, 3).join('; ')})` : ''}`, v.length === 0);
+  }
+
+  // E–G. Adaptive must not be easier than Classic for players who don't need it.
+  const ratio = (r, c) => r.lenTail / c.lenTail;
+  const e = ratio(idle, idleClassic);
+  check('E', `non-steering bot: adaptive/classic run length ${f(e)} ≤ ${RATIO.idleMax}`, e <= RATIO.idleMax);
+  for (const i of [1, 2]) {
+    const x = ratio(personal[i], classic[i]);
+    check('F', `bot ${personal[i].skill}: adaptive/classic run length ${f(x)} ≤ ${RATIO.capableMax}`, x <= RATIO.capableMax);
+  }
+  const g = ratio(personal[0], classic[0]);
+  check('G', `weak bot: adaptive/classic run length ${f(g)} within [${RATIO.weakMin}, ${RATIO.weakMax}]`, g >= RATIO.weakMin && g <= RATIO.weakMax);
+
+  // H. Storms stay at least 0.7 × as risky as the classic proposals they replace.
+  for (const i of [1, 2]) {
+    const h = personal[i].stormRiskRatio;
+    check('H', `bot ${personal[i].skill}: mean storm risk ${f(h)} × classic proposal ≥ ${RATIO.stormRiskMin}`, h >= RATIO.stormRiskMin);
   }
 
   console.log('  ACCEPTANCE');
@@ -401,9 +438,9 @@ for (const seed of SEEDS) {
 }
 
 console.log('\nOVERVIEW (seed × check: failures / total)');
-console.log(`  seed  ${['A', 'B', 'C', 'D'].map((c) => c.padStart(5)).join('')}`);
+console.log(`  seed  ${['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'].map((c) => c.padStart(5)).join('')}`);
 for (const seed of SEEDS) {
-  const cells = ['A', 'B', 'C', 'D'].map((id) => {
+  const cells = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'].map((id) => {
     const rows = overview.filter(([s, c]) => s === seed && c === id);
     const failed = rows.filter(([, , ok]) => !ok).length;
     return `${failed ? `${failed}✗` : '✓'}/${rows.length}`.padStart(5);
