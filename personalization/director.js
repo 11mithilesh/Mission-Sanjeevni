@@ -80,6 +80,29 @@ const RESCUE = { interval: 30, shield: 40 }; // s of run time per rescue gate; s
 // the base refill rate (no extra refills for struggling) and ease via threat-clear tension.
 const SEETA = { cooldown: 30, convenienceSlower: 3 };
 const CONVENIENCE_PUSH = 1.5;
+// Rings: `pass` mirrors main.js (a ring counts when the ship is within 2.1 of its centre).
+// While personalising, no ring is placed within `minOffset` of the ship, so collecting one
+// always takes a deliberate move.
+export const RING = { pass: 2.1, minOffset: 3.6 };
+
+// The spot within the ring area nearest `p` that is at least RING.minOffset from the ship
+// (p itself when it already is). Tries 16 directions around the ship.
+function awayFromShip(p, ctx) {
+  const { ship } = ctx;
+  if (Math.hypot(p.x - ship.x, p.y - ship.y) >= RING.minOffset) return p;
+  let best = null, bestD = Infinity;
+  for (let i = 0; i < 16; i++) {
+    const a = (i / 16) * Math.PI * 2;
+    for (const r of [RING.minOffset, RING.minOffset + 1.5, RING.minOffset + 3]) {
+      const x = clamp(ship.x + Math.cos(a) * r, ctx.xRange);
+      const y = clamp(ship.y + Math.sin(a) * r, ctx.yRange);
+      if (Math.hypot(x - ship.x, y - ship.y) < RING.minOffset) continue;
+      const d = Math.hypot(x - p.x, y - p.y);
+      if (d < bestD) { bestD = d; best = { x, y }; }
+    }
+  }
+  return best ?? p;
+}
 
 const clamp = (v, [a, b]) => Math.min(b, Math.max(a, v));
 const lerp = (a, b, k) => a + (b - a) * k;
@@ -385,19 +408,25 @@ export function createDirector({
     },
 
     // ctx: { x, y, z (classic proposal), xRange, yRange, ship, speed }
+    // Every ring placed while personalising (the classic share too) is at least
+    // RING.minOffset from the ship's current position: a ship that doesn't move never flies
+    // through one. Cold start / Classic mode keep the original placement.
     placeRing(ctx, variant) {
-      if (!personalising()) return { x: ctx.x, y: ctx.y };
+      if (confidence <= 0) return { x: ctx.x, y: ctx.y };
+      if (!personalising()) return awayFromShip({ x: ctx.x, y: ctx.y }, ctx);
       const pred = predictShip(model.profile, ctx.ship, arrival(ctx));
-      const want = model.profile.reach * lerp(0.8, 0.9, rng());
+      const want = Math.max(RING.minOffset, model.profile.reach * lerp(0.8, 0.9, rng()));
       const start = rng() * Math.PI * 2;
       let best = { x: ctx.x, y: ctx.y }, bestGap = Infinity;
       for (let i = 0; i < 8; i++) {
         const a = start + (i / 8) * Math.PI * 2;
         const x = clamp(pred.x + Math.cos(a) * want, ctx.xRange);
         const y = clamp(pred.y + Math.sin(a) * want, ctx.yRange);
+        if (Math.hypot(x - ctx.ship.x, y - ctx.ship.y) < RING.minOffset) continue;
         const gap = Math.abs(Math.hypot(x - pred.x, y - pred.y) - want);
         if (gap < bestGap) { bestGap = gap; best = { x, y }; }
       }
+      best = awayFromShip(best, ctx);
       logDecision({ kind: `ring:${variant}`, x: best.x, y: best.y, risk: 0, target: want, personal: true });
       return best;
     },

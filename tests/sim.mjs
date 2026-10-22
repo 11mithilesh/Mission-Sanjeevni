@@ -3,7 +3,7 @@
    Mirrors main.js gameplay (speeds, spawn spacing, wave shapes,
    collision ellipsoids, shield/invulnerability, gates) without
    Three.js. Run: node tests/sim.mjs  (checks A–H on seeds 0–4; exit code 1 on any
-   failed check; E–I run for each bot Shakti policy; SIM_SEED shifts the
+   failed check; E–J run for each bot Shakti policy; SIM_SEED shifts the
    seeds, SIM_VERBOSE=1 prints runs)
    ========================================================= */
 
@@ -144,6 +144,7 @@ function playRun(director, bot, rng, policy = 'never') {
   let stormRisk = 0, stormClassicRisk = 0; // placed vs. classic-proposal risk, summed over storms
   let hits = 0, passes = 0, riskSum = 0, riskTime = 0, waves = { wall: 0, scatter: 0, snake: 0, gate: 0 };
   let shaktiUses = 0, offeredSeeta = 0, offeredRam = 0, clearedThreat = 0, clearedFar = 0;
+  let ringsTaken = 0, ringsTakenPersonal = 0; // rings flown through (while personalising)
 
   // Mirrors main.js clearObstacles(): every storm on screen goes; storms still ahead are classified.
   const useShakti = () => {
@@ -274,6 +275,7 @@ function playRun(director, bot, rng, policy = 'never') {
       } else if (e.type === 'ring' && !e.passed && zOld < 0 && e.z >= 0) {
         e.passed = true;
         const through = (world.ship.x - e.x) ** 2 + (world.ship.y - e.y) ** 2 < 2.1 * 2.1;
+        if (through) { ringsTaken++; if (director.confidence > 0) ringsTakenPersonal++; }
         director.onEvent({ type: 'gate', passed: through, variant: e.variant, offered: e.offered });
         // Mirrors main.js onGate(): offered rings give only shield (ram) or only a charge (seeta).
         if (through && (!e.offered || e.variant === 'ram')) st.shield = Math.min(100, st.shield + 15);
@@ -297,7 +299,7 @@ function playRun(director, bot, rng, policy = 'never') {
   const faced = [...waveStats].filter(([id]) => wavePredicted.has(id));
   return {
     duration, cause, hits, passes, nearMisses, waves, calibration, violations, stormRisk, stormClassicRisk,
-    shaktiUses, offeredSeeta, offeredRam, clearedThreat, clearedFar,
+    shaktiUses, offeredSeeta, offeredRam, clearedThreat, clearedFar, ringsTaken, ringsTakenPersonal,
     waveHits: [...waveStats.values()].filter(Boolean).length, wavesFaced: waveStats.size,
     targetedWaves: faced.length,
     targetedHits: faced.filter(([, hit]) => hit).length,
@@ -316,6 +318,12 @@ function playRun(director, bot, rng, policy = 'never') {
 function runBot(skill, seed, { classic = false, policy = 'never' } = {}) {
   const rng = seeded(seed);
   const storage = createStorage({ defaults: defaultModel, backend: memoryBackend() });
+  if (skill === 'idle') {
+    // A player who used to make small moves (small learned reach), then parks the ship.
+    const parked = defaultModel();
+    parked.profile.reach = IDLE_REACH;
+    storage.save(parked);
+  }
   const newDirector = (s) => createDirector({ storage, rng: seeded(seed + 1000 + s), recorder: createRecorder() });
   let sessions = 1;
   let director = newDirector(sessions);
@@ -347,7 +355,8 @@ const spread = (lengths) => {
 
 // ---------- Acceptance thresholds ----------
 const BOTS = [[0.2, 11], [0.5, 22], [0.9, 33]];
-const IDLE = ['idle', 44];       // E: a bot that never steers
+const IDLE = ['idle', 44];       // E, J: a bot that never steers
+const IDLE_REACH = 2;            // its learned reach from earlier play (rings were placed by it)
 // Adaptive ÷ Classic mean run length (last TAIL runs), and minimum storm-risk ratio.
 const RATIO = { idleMax: 1.1, capableMax: 1.2, weakMin: 1.0, weakMax: 2.0, stormRiskMin: 0.7 };
 const BASE_SEED = Number(process.env.SIM_SEED || 0);
@@ -406,7 +415,7 @@ function printRuns(res, label) {
 
 const started = Date.now();
 const overview = []; // [seed, check, ok]
-const CHECK_IDS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
+const CHECK_IDS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
 const SEETA_PER_S = 1 / 30;      // I: director-offered Seeta rings per second of run time, at most
 const perMin = (rs, key) => (60 * sum(rs, (r) => r[key])) / Math.max(sum(rs, (r) => r.duration), 1e-9);
 
@@ -487,6 +496,10 @@ for (const seed of SEEDS) {
       check('H', tag(`bot ${personal[i].skill}: mean storm risk ${f(h)} × classic proposal ≥ ${RATIO.stormRiskMin}`), h >= RATIO.stormRiskMin);
     }
 
+    // J. A ship that never moves collects no rings once personalisation is on.
+    const parkedRings = sum(idle.runs, (x) => x.ringsTakenPersonal);
+    check('J', tag(`non-steering bot: rings collected while personalising ${parkedRings} = 0 (Adaptive ${f(perMin(idle.runs, 'ringsTaken'))}/min vs Classic ${f(perMin(idleClassic.runs, 'ringsTaken'))}/min)`), parkedRings === 0);
+
     // I. Director-offered Seeta rings: at most 1 per 30 s of run time, in every run.
     const over = all.flatMap((r) => r.runs.filter((x) => x.offeredSeeta > x.duration * SEETA_PER_S + 1e-9)
       .map((x) => `${r.skill}: ${x.offeredSeeta} in ${f(x.duration, 0)}s`));
@@ -497,7 +510,7 @@ for (const seed of SEEDS) {
   for (const [id, label, ok] of checks) console.log(`    ${ok ? 'PASS' : 'FAIL'}  ${id}  ${label}`);
 }
 
-console.log('\nOVERVIEW (seed × check: failures / total; E–I cover all Shakti policies)');
+console.log('\nOVERVIEW (seed × check: failures / total; E–J cover all Shakti policies)');
 console.log(`  seed  ${CHECK_IDS.map((c) => c.padStart(5)).join('')}`);
 for (const seed of SEEDS) {
   const cells = CHECK_IDS.map((id) => {

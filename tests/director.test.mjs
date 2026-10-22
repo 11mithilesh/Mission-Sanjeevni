@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createDirector, defaultModel, LIMITS, CLASSIC } from '../personalization/director.js';
+import { createDirector, defaultModel, LIMITS, CLASSIC, RING } from '../personalization/director.js';
 import { createStorage } from '../personalization/storage.js';
 import { createRecorder } from '../personalization/recorder.js';
 import { isStruggling, createProfileTracker, shaktiStyle } from '../personalization/profile.js';
@@ -387,6 +387,25 @@ test('Shakti clears: threats add near-miss tension and are counted; nothing labe
   assert.equal(director.model.risk.n, riskN);
   assert.equal(director.model.profile.shaktiClears, 4);
   assert.equal(director.recorder.recent(10, 'obstacle_clear').length, 4);
+});
+
+test('rings never land on a ship that is not moving (any learned reach, classic share too)', () => {
+  for (const reach of [0.5, 1.5, 2.5, 6]) {
+    const trained = defaultModel();
+    trained.profile.observations = 10000;
+    trained.profile.reach = reach;
+    const director = makeDirector({ model: trained, rng: seeded(21) });
+    director.onEvent({ type: 'run_start' });
+    const rng = seeded(5);
+    for (let i = 0; i < 400; i++) {
+      const parked = { x: -6 + (i % 13), y: 2 + (i % 5) * 1.2, vx: 0, vy: 0 };
+      const proposal = { x: -5.5 + 11 * rng(), y: 2.4 + 3.2 * rng() };
+      const ring = director.placeRing({ ...proposal, z: -260, xRange: [-5.5, 5.5], yRange: [2.4, 5.6], ship: parked, speed: 60 }, 'seeta');
+      const d = Math.hypot(ring.x - parked.x, ring.y - parked.y);
+      assert.ok(d >= RING.minOffset - 1e-9 && d > RING.pass, `reach ${reach}: ring ${d.toFixed(2)} from the ship`);
+      assert.ok(ring.x >= -5.5 && ring.x <= 5.5 && ring.y >= 2.4 && ring.y <= 5.6);
+    }
+  }
 });
 
 test('reset forgets everything but keeps the classic preference', () => {
