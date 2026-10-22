@@ -324,20 +324,29 @@ test('Seeta refills: only at 0 charges, one in flight, ≥ 30 s apart; never in 
 });
 
 test('Shakti style from clears, uses per minute and storms on screen', () => {
-  const p = (over) => ({ ...defaultModel().profile, shaktiClears: 20, ...over });
-  assert.equal(shaktiStyle(p({ shaktiClears: 3 })), 'unknown');
-  assert.equal(shaktiStyle(p({ clearThreatShare: 0.7 })), 'panic');
-  assert.equal(shaktiStyle(p({ clearThreatShare: 0.1, shaktiPerMin: 1.2 })), 'convenience');
-  assert.equal(shaktiStyle(p({ clearThreatShare: 0.1, shaktiPerMin: 0.2, shaktiThreat: 6 })), 'convenience');
-  assert.equal(shaktiStyle(p({ clearThreatShare: 0.1, shaktiPerMin: 0.2, shaktiThreat: 2 })), 'mixed');
-  assert.equal(shaktiStyle(p({ clearThreatShare: 0.35 })), 'mixed');
+  const p = (over) => ({ ...defaultModel().profile, shaktiUses: 20, ...over });
+  assert.equal(shaktiStyle(p({ shaktiUses: 3 })), 'unknown');
+  assert.equal(shaktiStyle(p({ threatUseShare: 0.7 })), 'panic');
+  assert.equal(shaktiStyle(p({ threatUseShare: 0.1, shaktiPerMin: 1.2 })), 'convenience');
+  assert.equal(shaktiStyle(p({ threatUseShare: 0.1, shaktiPerMin: 0.2, shaktiThreat: 6 })), 'convenience');
+  assert.equal(shaktiStyle(p({ threatUseShare: 0.1, shaktiPerMin: 0.2, shaktiThreat: 2 })), 'mixed');
+  assert.equal(shaktiStyle(p({ threatUseShare: 0.35 })), 'mixed');
+
+  // A pure panic user: every use clears one imminent threat among four far storms on screen.
+  const tracker = createProfileTracker(defaultModel().profile);
+  for (let i = 0; i < 20; i++) {
+    tracker.update({ type: 'shakti_used', threats: 5, clears: ['cleared_threat', 'cleared_far', 'cleared_far', 'cleared_far', 'cleared_far'] });
+    for (const outcome of ['cleared_threat', 'cleared_far', 'cleared_far', 'cleared_far', 'cleared_far']) tracker.update({ type: 'obstacle_clear', outcome });
+  }
+  assert.ok(tracker.profile.clearThreatShare < 0.3, 'mostly far clears by storm count');
+  assert.equal(shaktiStyle(tracker.profile), 'panic', 'but every use was a panic use');
 });
 
 test('convenience Shakti users get rarer refills and a faster push; panic users the base rate', () => {
   const run = (over) => {
     const trained = defaultModel();
     trained.profile.observations = 10000;
-    Object.assign(trained.profile, { shaktiClears: 20, shaktiPerMin: 1.5, recentRuns: new Array(15).fill(60) }, over);
+    Object.assign(trained.profile, { shaktiUses: 20, shaktiPerMin: 1.5, recentRuns: new Array(15).fill(60) }, over);
     const director = makeDirector({ model: trained });
     director.onEvent({ type: 'run_start' });
     const offers = [];
@@ -355,8 +364,8 @@ test('convenience Shakti users get rarer refills and a faster push; panic users 
     for (let i = 0; i < 300; i++) director.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false });
     return { style: director.shaktiStyle, offers, push: director.model.director.speedMul - before };
   };
-  const panic = run({ clearThreatShare: 0.8 });
-  const convenience = run({ clearThreatShare: 0.05 });
+  const panic = run({ threatUseShare: 0.8 });
+  const convenience = run({ threatUseShare: 0.05 });
   assert.equal(panic.style, 'panic');
   assert.equal(convenience.style, 'convenience');
   assert.deepEqual(panic.offers, [30, 60, 90, 120, 150, 180]);

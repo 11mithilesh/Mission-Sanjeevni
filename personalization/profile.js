@@ -18,17 +18,20 @@ export const STRUGGLE = { recent: 3, share: 0.6, minRuns: 6 };
 export const ACTIVE = { speed: 2, share: 0.2, alpha: 0.01 };
 export const engagement = (p) => Math.min(1, p.activity / ACTIVE.share);
 
-// How the player uses Shakti, from the storms it cleared:
-// 'panic'       mostly imminent threats (struggling: slight easing via tension, base refills);
-// 'convenience' mostly far/low-threat clears, used often or with many storms on screen
-//               (fewer refill offers, the controller pushes harder);
-// 'mixed' otherwise, 'unknown' until enough clears are seen.
-export const SHAKTI_STYLE = { minClears: 8, panicShare: 0.5, convenienceShare: 0.25, usesPerMin: 0.5, threat: 4 };
+// How the player uses Shakti. Judged per USE (did it clear an imminent threat?), not per
+// storm: one use clears every storm on screen, so even a pure panic use is mostly far clears
+// by storm count (the per-storm clearThreatShare is kept for reference).
+// 'panic'       mostly uses that clear an imminent threat (struggling: slight easing via
+//               tension, base refills);
+// 'convenience' mostly uses with no imminent threat, used often or with many storms on
+//               screen (fewer refill offers, the controller pushes harder);
+// 'mixed' otherwise, 'unknown' until enough uses are seen.
+export const SHAKTI_STYLE = { minUses: 5, panicShare: 0.5, convenienceShare: 0.25, usesPerMin: 0.5, threat: 4 };
 export function shaktiStyle(p) {
   const s = SHAKTI_STYLE;
-  if (p.shaktiClears < s.minClears) return 'unknown';
-  if (p.clearThreatShare >= s.panicShare) return 'panic';
-  if (p.clearThreatShare < s.convenienceShare && (p.shaktiPerMin >= s.usesPerMin || p.shaktiThreat >= s.threat)) {
+  if (p.shaktiUses < s.minUses) return 'unknown';
+  if (p.threatUseShare >= s.panicShare) return 'panic';
+  if (p.threatUseShare < s.convenienceShare && (p.shaktiPerMin >= s.usesPerMin || p.shaktiThreat >= s.threat)) {
     return 'convenience';
   }
   return 'mixed';
@@ -52,7 +55,9 @@ export function defaultProfile() {
     shaktiThreat: 3,         // obstacles on screen when Shakti is used
     shaktiPerMin: 0.5,
     clearThreatShare: 0.5,   // share of Shakti-cleared storms that were imminent threats
-    shaktiClears: 0,         // Shakti-cleared storms seen (gates shaktiStyle)
+    shaktiClears: 0,         // Shakti-cleared storms seen
+    threatUseShare: 0.5,     // share of Shakti uses that cleared at least one imminent threat
+    shaktiUses: 0,           // Shakti uses seen with clear outcomes (gates shaktiStyle)
     themes: {},              // storm theme -> hit rate
     observations: 0,         // obstacle outcomes seen (drives personalisation fade-in)
     runs: 0,
@@ -135,6 +140,10 @@ export function createProfileTracker(profile) {
         case 'shakti_used':
           runShakti++;
           p.shaktiThreat = ewma(p.shaktiThreat, e.threats ?? 0, 0.2);
+          if (e.clears?.length) {
+            p.shaktiUses++;
+            p.threatUseShare = ewma(p.threatUseShare, e.clears.includes('cleared_threat') ? 1 : 0, 0.15);
+          }
           break;
         case 'obstacle_clear':
           p.shaktiClears++;
