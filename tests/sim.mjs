@@ -3,13 +3,14 @@
    Mirrors main.js gameplay (speeds, spawn spacing, wave shapes,
    collision ellipsoids, shield/invulnerability, gates) without
    Three.js. Run: node tests/sim.mjs  (checks A–H on seeds 0–4; exit code 1 on any
-   failed check; SIM_SEED shifts the seeds, SIM_VERBOSE=1 prints runs)
+   failed check; E–I run for each bot Shakti policy; SIM_SEED shifts the
+   seeds, SIM_VERBOSE=1 prints runs)
    ========================================================= */
 
 import { createDirector, defaultModel, LIMITS } from '../personalization/director.js';
 import { createStorage } from '../personalization/storage.js';
 import { createRecorder } from '../personalization/recorder.js';
-import { classifyObstaclePass } from '../personalization/obstacles.js';
+import { classifyObstaclePass, classifyShaktiClear } from '../personalization/obstacles.js';
 import { seeded, memoryBackend } from './helpers.mjs';
 
 const BOUNDS = { x: 9, yMin: 0.9, yMax: 7.2 };
@@ -107,8 +108,27 @@ function checkGuardrails(director, t, violations) {
   guard(violations, 'tension', director.tension, [0, 1]);
 }
 
+// ---------- Shakti policies: when a bot spends a charge ----------
+// never: never; panic: a storm is about to hit (≤ PANIC_TTA s, overlapping, not invulnerable);
+// busy: ≥ BUSY.storms storms arriving within BUSY.within s.
+const POLICIES = ['never', 'panic', 'busy'];
+const PANIC_TTA = 0.4;
+const BUSY = { storms: 4, within: 2 };
+function wantsShakti(policy, world, st) {
+  if (policy === 'never' || st.powerCharges <= 0) return false;
+  let soon = 0;
+  for (const e of world.entities) {
+    if (e.type !== 'crystal' || e.passed || e.z > 0) continue;
+    const tta = -e.z / Math.max(world.speed, 1);
+    if (policy === 'panic' && st.invuln <= 0 && tta <= PANIC_TTA
+      && classifyShaktiClear(e, world.ship, world.speed) === 'cleared_threat') return true;
+    if (tta <= BUSY.within) soon++;
+  }
+  return policy === 'busy' && soon >= BUSY.storms;
+}
+
 // ---------- One run (mirrors main.js frame/updateEntities/wave*) ----------
-function playRun(director, bot, rng) {
+function playRun(director, bot, rng, policy = 'never') {
   const rand = (a, b) => a + rng() * (b - a);
   const world = {
     time: 0, speed: 26, entities: [], ship: { x: 0, y: MID_Y, vx: 0, vy: 0 }, target: { x: 0, y: MID_Y },
@@ -123,6 +143,25 @@ function playRun(director, bot, rng) {
   let tensionSum = 0, brakeTime = 0;
   let stormRisk = 0, stormClassicRisk = 0; // placed vs. classic-proposal risk, summed over storms
   let hits = 0, passes = 0, riskSum = 0, riskTime = 0, waves = { wall: 0, scatter: 0, snake: 0, gate: 0 };
+  let shaktiUses = 0, offeredSeeta = 0, offeredRam = 0, clearedThreat = 0, clearedFar = 0;
+
+  // Mirrors main.js clearObstacles(): every storm on screen goes; storms still ahead are classified.
+  const useShakti = () => {
+    const storms = world.entities.filter((e) => e.type === 'crystal');
+    if (!storms.length) return;
+    st.powerCharges--;
+    shaktiUses++;
+    const waveIds = [], clears = [];
+    for (const e of storms) {
+      if (e.passed) continue;
+      if (e.waveId !== null) waveIds.push(e.waveId);
+      const c = classifyShaktiClear(e, world.ship, world.speed);
+      clears.push(c);
+      if (c === 'cleared_threat') clearedThreat++; else clearedFar++;
+    }
+    world.entities = world.entities.filter((e) => e.type !== 'crystal');
+    director.onEvent({ type: 'shakti_used', threats: storms.length, waveIds, clears });
+  };
 
   bot.reset(); // world time restarts at 0 each run
   director.onEvent({ type: 'run_start' });
@@ -139,7 +178,7 @@ function playRun(director, bot, rng) {
       passed: false, waveId: wave.id, features: p.features, side: p.side, theme, risk: p.risk,
     });
   };
-  const ring = (x, y, z, variant) => world.entities.push({ type: 'ring', x, y, z, variant, passed: false });
+  const ring = (x, y, z, variant, offered) => world.entities.push({ type: 'ring', x, y, z, variant, offered, passed: false });
 
   const W = {
     scatter(d, wave) {
@@ -157,7 +196,8 @@ function playRun(director, bot, rng) {
       const alternate = gateCount++ % 2 === 0 ? 'ram' : 'seeta';
       const variant = wave.variant ?? alternate;
       const { x, y } = director.placeRing({ x: rand(-5.5, 5.5), y: rand(2.4, 5.6), z, xRange: [-5.5, 5.5], yRange: [2.4, 5.6], ship: shipCtx(), speed: world.speed }, variant);
-      ring(x, y, z, variant);
+      ring(x, y, z, variant, wave.offered);
+      if (wave.offered) { if (variant === 'seeta') offeredSeeta++; else offeredRam++; }
       if (d > 0.4) crystal(wave, clamp(x + (rng() < 0.5 ? -1 : 1) * 4.6, -9, 9), y, z, 1, 1.6);
     },
     wall(d, wave) {
@@ -210,6 +250,7 @@ function playRun(director, bot, rng) {
     world.ship.vx = (world.ship.x - px) / DT;
     world.ship.vy = (world.ship.y - py) / DT;
     if (st.invuln > 0) st.invuln -= DT;
+    if (wantsShakti(policy, world, st)) useShakti();
 
     // Entities
     for (let i = world.entities.length - 1; i >= 0; i--) {
@@ -233,11 +274,10 @@ function playRun(director, bot, rng) {
       } else if (e.type === 'ring' && !e.passed && zOld < 0 && e.z >= 0) {
         e.passed = true;
         const through = (world.ship.x - e.x) ** 2 + (world.ship.y - e.y) ** 2 < 2.1 * 2.1;
-        director.onEvent({ type: 'gate', passed: through, variant: e.variant });
-        if (through) {
-          st.shield = Math.min(100, st.shield + 15);
-          if (e.variant === 'seeta') st.powerCharges = Math.min(3, st.powerCharges + 1);
-        }
+        director.onEvent({ type: 'gate', passed: through, variant: e.variant, offered: e.offered });
+        // Mirrors main.js onGate(): offered rings give only shield (ram) or only a charge (seeta).
+        if (through && (!e.offered || e.variant === 'ram')) st.shield = Math.min(100, st.shield + 15);
+        if (through && e.variant === 'seeta') st.powerCharges = Math.min(3, st.powerCharges + 1);
       }
       if (e.z > DESPAWN_Z) world.entities.splice(i, 1);
     }
@@ -257,6 +297,7 @@ function playRun(director, bot, rng) {
   const faced = [...waveStats].filter(([id]) => wavePredicted.has(id));
   return {
     duration, cause, hits, passes, nearMisses, waves, calibration, violations, stormRisk, stormClassicRisk,
+    shaktiUses, offeredSeeta, offeredRam, clearedThreat, clearedFar,
     waveHits: [...waveStats.values()].filter(Boolean).length, wavesFaced: waveStats.size,
     targetedWaves: faced.length,
     targetedHits: faced.filter(([, hit]) => hit).length,
@@ -272,7 +313,7 @@ function playRun(director, bot, rng) {
 // One bot plays RUNS runs. When it rage-quits, the session ends and the next run starts a
 // new session whose director reloads the saved model (exercises cross-session learning).
 // `classic` runs the same bot and seed with Classic mode on, as the baseline for check C.
-function runBot(skill, seed, { classic = false } = {}) {
+function runBot(skill, seed, { classic = false, policy = 'never' } = {}) {
   const rng = seeded(seed);
   const storage = createStorage({ defaults: defaultModel, backend: memoryBackend() });
   const newDirector = (s) => createDirector({ storage, rng: seeded(seed + 1000 + s), recorder: createRecorder() });
@@ -282,7 +323,7 @@ function runBot(skill, seed, { classic = false } = {}) {
   const bot = skill === 'idle' ? createIdleBot() : createBot(skill, seeded(seed + 2000));
   const runs = [];
   for (let i = 0; i < RUNS; i++) {
-    const run = playRun(director, bot, rng);
+    const run = playRun(director, bot, rng, policy);
     runs.push(run);
     if (bot.quits(run)) {
       run.quit = true;
@@ -365,82 +406,101 @@ function printRuns(res, label) {
 
 const started = Date.now();
 const overview = []; // [seed, check, ok]
+const CHECK_IDS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
+const SEETA_PER_S = 1 / 30;      // I: director-offered Seeta rings per second of run time, at most
+const perMin = (rs, key) => (60 * sum(rs, (r) => r[key])) / Math.max(sum(rs, (r) => r.duration), 1e-9);
+
 for (const seed of SEEDS) {
-  const personal = BOTS.map(([skill, s]) => summarise(skill, runBot(skill, s + seed)));
-  const classic = BOTS.map(([skill, s]) => summarise(skill, runBot(skill, s + seed, { classic: true })));
-  const idle = summarise(IDLE[0], runBot(IDLE[0], IDLE[1] + seed));
-  const idleClassic = summarise(IDLE[0], runBot(IDLE[0], IDLE[1] + seed, { classic: true }));
   const checks = [];
   const check = (id, label, ok) => { checks.push([id, label, ok]); overview.push([seed, id, ok]); };
-
   console.log(`\n================ SEED ${seed} ================`);
-  if (VERBOSE) {
-    [...personal, idle].forEach((r) => printRuns(r, 'Adaptive'));
-    [...classic, idleClassic].forEach((r) => printRuns(r, 'Classic'));
-  }
 
-  console.log(`  bot   realised  predicted  waves   len first10→last10  len(last ${TAIL}) adaptive / classic  ratio  storm risk×  skill  speed×`);
-  [...personal, idle].forEach((r, i) => {
-    const c = i < personal.length ? classic[i] : idleClassic;
-    console.log(`  ${String(r.skill).padEnd(4)}  ${f(r.realised, 3).padStart(8)}  ${f(r.target, 3).padStart(9)}  ${String(r.targetedWaves).padStart(5)}  ${`${f(r.lenFirst10, 0)} → ${f(r.lenLast10, 0)}`.padStart(19)}  ${`${f(r.lenTail, 0)} / ${f(c.lenTail, 0)}`.padStart(28)}  ${f(r.lenTail / c.lenTail).padStart(5)}  ${f(r.stormRiskRatio).padStart(11)}  ${f(r.last.skill).padStart(5)}  ${f(r.last.speedMul).padStart(6)}`);
-  });
+  for (const policy of POLICIES) {
+    const run = (skill, s, classic) => summarise(skill, runBot(skill, s + seed, { classic, policy }));
+    const personal = BOTS.map(([skill, s]) => run(skill, s, false));
+    const classic = BOTS.map(([skill, s]) => run(skill, s, true));
+    const idle = run(IDLE[0], IDLE[1], false);
+    const idleClassic = run(IDLE[0], IDLE[1], true);
+    const all = [...personal, idle], allClassic = [...classic, idleClassic];
+    const tag = (label) => (policy === 'never' ? label : `[shakti: ${policy}] ${label}`);
 
-  // A. Realised wave hit rate tracks the wave risk predicted when the waves were placed.
-  for (const r of personal) {
-    const gap = Math.abs(r.realised - r.target);
-    check('A', `bot ${r.skill}: |realised ${f(r.realised, 3)} − predicted ${f(r.target, 3)}| = ${f(gap, 3)} ≤ ${TRACK_TOL}`, gap <= TRACK_TOL);
-  }
-
-  // B. Risk-model calibration per predicted-risk bin.
-  console.log(`  calibration (last ${TAIL} runs): bin  n  predicted → observed  (tol)`);
-  for (const r of personal) {
-    for (const b of r.bins) {
-      if (!b.n) continue;
-      console.log(`    bot ${r.skill}  [${b.lo}, ${b.hi})  ${String(b.n).padStart(5)}  ${f(b.predicted, 3)} → ${f(b.observed, 3)}  (±${f(b.tol, 3)})${b.judged ? (b.ok ? '' : '  OFF') : '  (too few, not judged)'}`);
+    console.log(`\n  --- Shakti policy: ${policy} ---`);
+    if (VERBOSE) {
+      all.forEach((r) => printRuns(r, `Adaptive/${policy}`));
+      allClassic.forEach((r) => printRuns(r, `Classic/${policy}`));
     }
-    const judged = r.bins.filter((b) => b.judged);
-    const bad = judged.filter((b) => !b.ok).map((b) => `[${b.lo}, ${b.hi})`);
-    check('B', `bot ${r.skill}: ${judged.length - bad.length}/${judged.length} judged risk bins calibrated${bad.length ? ` (off: ${bad.join(' ')})` : ''}`,
-      judged.length > 0 && bad.length === 0);
+    console.log(`  bot   realised  predicted  len first10→last10  len(last ${TAIL}) adaptive / classic  ratio  storm risk×  Shakti/min A / C  offered seeta·ram/min A / C  threat clears`);
+    all.forEach((r, i) => {
+      const c = allClassic[i];
+      const clears = sum(r.runs, (x) => x.clearedThreat + x.clearedFar);
+      console.log(`  ${String(r.skill).padEnd(4)}  ${f(r.realised, 3).padStart(8)}  ${f(r.target, 3).padStart(9)}  ${`${f(r.lenFirst10, 0)} → ${f(r.lenLast10, 0)}`.padStart(18)}  ${`${f(r.lenTail, 0)} / ${f(c.lenTail, 0)}`.padStart(28)}  ${f(r.lenTail / c.lenTail).padStart(5)}  ${f(r.stormRiskRatio).padStart(11)}  ${`${f(perMin(r.runs, 'shaktiUses'))} / ${f(perMin(c.runs, 'shaktiUses'))}`.padStart(16)}  ${`${f(perMin(r.runs, 'offeredSeeta'))}·${f(perMin(r.runs, 'offeredRam'))} / ${f(perMin(c.runs, 'offeredSeeta'))}·${f(perMin(c.runs, 'offeredRam'))}`.padStart(27)}  ${clears ? f(sum(r.runs, (x) => x.clearedThreat) / clears) : '—'}`);
+    });
+
+    // A–D are about the director's models and clamps; judged once, on the no-Shakti runs.
+    if (policy === 'never') {
+      // A. Realised wave hit rate tracks the wave risk predicted when the waves were placed.
+      for (const r of personal) {
+        const gap = Math.abs(r.realised - r.target);
+        check('A', `bot ${r.skill}: |realised ${f(r.realised, 3)} − predicted ${f(r.target, 3)}| = ${f(gap, 3)} ≤ ${TRACK_TOL}`, gap <= TRACK_TOL);
+      }
+
+      // B. Risk-model calibration per predicted-risk bin.
+      console.log(`  calibration (last ${TAIL} runs): bin  n  predicted → observed  (tol)`);
+      for (const r of personal) {
+        for (const b of r.bins) {
+          if (!b.n) continue;
+          console.log(`    bot ${r.skill}  [${b.lo}, ${b.hi})  ${String(b.n).padStart(5)}  ${f(b.predicted, 3)} → ${f(b.observed, 3)}  (±${f(b.tol, 3)})${b.judged ? (b.ok ? '' : '  OFF') : '  (too few, not judged)'}`);
+        }
+        const judged = r.bins.filter((b) => b.judged);
+        const bad = judged.filter((b) => !b.ok).map((b) => `[${b.lo}, ${b.hi})`);
+        check('B', `bot ${r.skill}: ${judged.length - bad.length}/${judged.length} judged risk bins calibrated${bad.length ? ` (off: ${bad.join(' ')})` : ''}`,
+          judged.length > 0 && bad.length === 0);
+      }
+
+      // C. Mid bot's runs don't get shorter; spread across bots shrinks vs. Classic mode.
+      const mid = personal[1];
+      check('C', `mid bot runs do not get shorter (${f(mid.lenFirst10, 0)}s → ${f(mid.lenLast10, 0)}s)`, mid.lenLast10 >= mid.lenFirst10);
+      const sp = spread(personal.map((r) => r.lenTail)), sc = spread(classic.map((r) => r.lenTail));
+      check('C', `run-length spread across bots (CV) ${f(sp)} < classic ${f(sc)}`, sp < sc);
+
+      // D. Guardrail clamps never exceeded (personalised and classic runs, every tick).
+      for (const [label, set] of [['personal', all], ['classic', allClassic]]) {
+        const v = set.flatMap((r) => r.violations);
+        check('D', `${label}: guardrail clamps never exceeded${v.length ? ` (${v.slice(0, 3).join('; ')})` : ''}`, v.length === 0);
+      }
+    }
+
+    // E–G. Adaptive must not be easier than Classic for players who don't need it.
+    const ratio = (r, c) => r.lenTail / c.lenTail;
+    const e = ratio(idle, idleClassic);
+    check('E', tag(`non-steering bot: adaptive/classic run length ${f(e)} ≤ ${RATIO.idleMax}`), e <= RATIO.idleMax);
+    for (const i of [1, 2]) {
+      const x = ratio(personal[i], classic[i]);
+      check('F', tag(`bot ${personal[i].skill}: adaptive/classic run length ${f(x)} ≤ ${RATIO.capableMax}`), x <= RATIO.capableMax);
+    }
+    const g = ratio(personal[0], classic[0]);
+    check('G', tag(`weak bot: adaptive/classic run length ${f(g)} within [${RATIO.weakMin}, ${RATIO.weakMax}]`), g >= RATIO.weakMin && g <= RATIO.weakMax);
+
+    // H. Storms stay at least 0.7 × as risky as the classic proposals they replace.
+    for (const i of [1, 2]) {
+      const h = personal[i].stormRiskRatio;
+      check('H', tag(`bot ${personal[i].skill}: mean storm risk ${f(h)} × classic proposal ≥ ${RATIO.stormRiskMin}`), h >= RATIO.stormRiskMin);
+    }
+
+    // I. Director-offered Seeta rings: at most 1 per 30 s of run time, in every run.
+    const over = all.flatMap((r) => r.runs.filter((x) => x.offeredSeeta > x.duration * SEETA_PER_S + 1e-9)
+      .map((x) => `${r.skill}: ${x.offeredSeeta} in ${f(x.duration, 0)}s`));
+    check('I', tag(`offered Seeta rings ≤ 1 per 30 s in every run${over.length ? ` (over: ${over.slice(0, 3).join('; ')})` : ''}`), over.length === 0);
   }
 
-  // C. Mid bot's runs don't get shorter; spread across bots shrinks vs. Classic mode.
-  const mid = personal[1];
-  check('C', `mid bot runs do not get shorter (${f(mid.lenFirst10, 0)}s → ${f(mid.lenLast10, 0)}s)`, mid.lenLast10 >= mid.lenFirst10);
-  const sp = spread(personal.map((r) => r.lenTail)), sc = spread(classic.map((r) => r.lenTail));
-  check('C', `run-length spread across bots (CV) ${f(sp)} < classic ${f(sc)}`, sp < sc);
-
-  // D. Guardrail clamps never exceeded (personalised and classic runs, every tick).
-  for (const [label, set] of [['personal', [...personal, idle]], ['classic', [...classic, idleClassic]]]) {
-    const v = set.flatMap((r) => r.violations);
-    check('D', `${label}: guardrail clamps never exceeded${v.length ? ` (${v.slice(0, 3).join('; ')})` : ''}`, v.length === 0);
-  }
-
-  // E–G. Adaptive must not be easier than Classic for players who don't need it.
-  const ratio = (r, c) => r.lenTail / c.lenTail;
-  const e = ratio(idle, idleClassic);
-  check('E', `non-steering bot: adaptive/classic run length ${f(e)} ≤ ${RATIO.idleMax}`, e <= RATIO.idleMax);
-  for (const i of [1, 2]) {
-    const x = ratio(personal[i], classic[i]);
-    check('F', `bot ${personal[i].skill}: adaptive/classic run length ${f(x)} ≤ ${RATIO.capableMax}`, x <= RATIO.capableMax);
-  }
-  const g = ratio(personal[0], classic[0]);
-  check('G', `weak bot: adaptive/classic run length ${f(g)} within [${RATIO.weakMin}, ${RATIO.weakMax}]`, g >= RATIO.weakMin && g <= RATIO.weakMax);
-
-  // H. Storms stay at least 0.7 × as risky as the classic proposals they replace.
-  for (const i of [1, 2]) {
-    const h = personal[i].stormRiskRatio;
-    check('H', `bot ${personal[i].skill}: mean storm risk ${f(h)} × classic proposal ≥ ${RATIO.stormRiskMin}`, h >= RATIO.stormRiskMin);
-  }
-
-  console.log('  ACCEPTANCE');
+  console.log('\n  ACCEPTANCE');
   for (const [id, label, ok] of checks) console.log(`    ${ok ? 'PASS' : 'FAIL'}  ${id}  ${label}`);
 }
 
-console.log('\nOVERVIEW (seed × check: failures / total)');
-console.log(`  seed  ${['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'].map((c) => c.padStart(5)).join('')}`);
+console.log('\nOVERVIEW (seed × check: failures / total; E–I cover all Shakti policies)');
+console.log(`  seed  ${CHECK_IDS.map((c) => c.padStart(5)).join('')}`);
 for (const seed of SEEDS) {
-  const cells = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'].map((id) => {
+  const cells = CHECK_IDS.map((id) => {
     const rows = overview.filter(([s, c]) => s === seed && c === id);
     const failed = rows.filter(([, , ok]) => !ok).length;
     return `${failed ? `${failed}✗` : '✓'}/${rows.length}`.padStart(5);
