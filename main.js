@@ -1674,11 +1674,8 @@ function updateEntities(dt, dz, t) {
         const dzn = zc / (e.rx + 0.8);
         const d2 = dx * dx + dy * dy + dzn * dzn; // < 1 means inside the collision ellipsoid
         if (state.invuln <= 0 && d2 < 1) { reportObstacle(e, 'hit'); onHit(e); removeAt(i); continue; }
-        const outcome = classifyObstaclePass({ zc, rx: e.rx, d2, passed: e.passed });
-        if (outcome !== null) {
-          e.passed = true;
-          reportObstacle(e, outcome);
-        }
+        const outcome = classifyObstaclePass(e, { zc, rx: e.rx, d2, invuln: state.invuln });
+        if (outcome !== null) reportObstacle(e, outcome);
       }
     } else if (e.type === 'orb') {
       const fruit = m.children[m.userData.fruitIndex];

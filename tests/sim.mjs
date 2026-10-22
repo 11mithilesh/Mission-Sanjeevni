@@ -220,11 +220,8 @@ function playRun(director, bot, rng) {
           world.entities.splice(i, 1);
           continue;
         }
-        const outcome = classifyObstaclePass({ zc, rx: e.rx, d2, passed: e.passed });
-        if (outcome !== null) {
-          e.passed = true;
-          report(e, outcome);
-        }
+        const outcome = classifyObstaclePass(e, { zc, rx: e.rx, d2, invuln: st.invuln });
+        if (outcome !== null) report(e, outcome);
       } else if (e.type === 'ring' && !e.passed && zOld < 0 && e.z >= 0) {
         e.passed = true;
         const through = (world.ship.x - e.x) ** 2 + (world.ship.y - e.y) ** 2 < 2.1 * 2.1;
