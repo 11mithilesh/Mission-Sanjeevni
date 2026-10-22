@@ -3,7 +3,7 @@
    Mirrors main.js gameplay (speeds, spawn spacing, wave shapes,
    collision ellipsoids, shield/invulnerability, gates) without
    Three.js. Run: node tests/sim.mjs  (checks A–H on seeds 0–4; exit code 1 on any
-   failed check; E–J run for each bot Shakti policy; SIM_SEED shifts the
+   failed check; E–K run for each bot Shakti policy; SIM_SEED shifts the
    seeds, SIM_VERBOSE=1 prints runs)
    ========================================================= */
 
@@ -133,7 +133,10 @@ function playRun(director, bot, rng, policy = 'never') {
   const world = {
     time: 0, speed: 26, entities: [], ship: { x: 0, y: MID_Y, vx: 0, vy: 0 }, target: { x: 0, y: MID_Y },
   };
-  const st = { shield: 100, invuln: 1, runTime: 0, dist: 0, nextSpawn: 40, powerCharges: 3 };
+  const st = { shield: 100, invuln: 1, runTime: 0, dist: 0, nextSpawn: 40, powerCharges: 3, score: 0, combo: 0 };
+  // Score mirrors main.js (distance at Classic speed + gates × combo multiplier); the sim has no
+  // fruit, so its scores run lower than the game's.
+  const multiplier = () => Math.min(8, 1 + Math.floor(st.combo / 4));
   let gateCount = 0;
   const waveStats = new Map(); // wave id -> did any of its obstacles hit the player?
   const wavePredicted = new Map(); // wave id -> predicted P(wave hits) at placement: 1 − Π(1 − risk)
@@ -232,6 +235,7 @@ function playRun(director, bot, rng, policy = 'never') {
     world.speed += (targetSpeed - world.speed) * (1 - Math.exp(-2 * DT));
     const dz = world.speed * DT;
     st.dist += dz;
+    st.score += (dz / director.speedMultiplier()) * 0.1;
     if (st.dist >= st.nextSpawn) {
       let obstacles = 0;
       for (const e of world.entities) if (e.type === 'crystal') obstacles++;
@@ -266,7 +270,7 @@ function playRun(director, bot, rng, policy = 'never') {
         const d2 = dx * dx + dy * dy + dzn * dzn;
         if (st.invuln <= 0 && d2 < 1) {
           report(e, 'hit');
-          st.shield -= 34; st.invuln = 1.2;
+          st.shield -= 34; st.invuln = 1.2; st.combo = 0;
           world.entities.splice(i, 1);
           continue;
         }
@@ -279,12 +283,13 @@ function playRun(director, bot, rng, policy = 'never') {
         director.onEvent({ type: 'gate', passed: through, variant: e.variant, offered: e.offered });
         // Mirrors main.js onGate(): offered rings give only shield (ram) or only a charge (seeta).
         if (through && (!e.offered || e.variant === 'ram')) st.shield = Math.min(100, st.shield + 15);
+        if (through && !e.offered) { st.combo += 2; st.score += 100 * multiplier(); }
         if (through && e.variant === 'seeta') st.powerCharges = Math.min(3, st.powerCharges + 1);
       }
       if (e.z > DESPAWN_Z) world.entities.splice(i, 1);
     }
 
-    director.tick(DT, { playing: true, ship: world.ship, target: world.target, boost: false });
+    director.tick(DT, { playing: true, ship: world.ship, target: world.target, boost: false, score: st.score });
     if (director.confidence > 0) { riskSum += director.model.director.riskMul * DT; riskTime += DT; }
     tensionSum += director.tension * DT; brakeTime += director.brake > 0 ? DT : 0;
     checkGuardrails(director, st.runTime, violations);
@@ -292,14 +297,14 @@ function playRun(director, bot, rng, policy = 'never') {
 
   const duration = st.runTime;
   const cause = st.shield > 0 ? 'cap' : 'shield';
-  director.onEvent({ type: 'run_end', duration, score: 0, cause });
+  director.onEvent({ type: 'run_end', duration, score: Math.floor(st.score), cause });
   director.save();
   const m = director.model.director;
   // Storm-carrying waves that reached the player: realised hit vs. predicted wave risk at placement.
   const faced = [...waveStats].filter(([id]) => wavePredicted.has(id));
   return {
     duration, cause, hits, passes, nearMisses, waves, calibration, violations, stormRisk, stormClassicRisk,
-    shaktiUses, offeredSeeta, offeredRam, clearedThreat, clearedFar, ringsTaken, ringsTakenPersonal,
+    shaktiUses, offeredSeeta, offeredRam, clearedThreat, clearedFar, ringsTaken, ringsTakenPersonal, score: Math.floor(st.score),
     waveHits: [...waveStats.values()].filter(Boolean).length, wavesFaced: waveStats.size,
     targetedWaves: faced.length,
     targetedHits: faced.filter(([, hit]) => hit).length,
@@ -415,7 +420,22 @@ function printRuns(res, label) {
 
 const started = Date.now();
 const overview = []; // [seed, check, ok]
-const CHECK_IDS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
+const CHECK_IDS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'];
+// K: runs 1–warmup set the bar; after that, the share of runs that beat every earlier score,
+// and mean score of the last half ÷ the first half of the post-warm-up runs.
+const BEST = { warmup: 10, rate: 0.1, trend: 1.15 };
+function bestStats(runs) {
+  const scores = runs.map((r) => r.score);
+  let best = Math.max(...scores.slice(0, BEST.warmup)), newBests = 0;
+  for (const s of scores.slice(BEST.warmup)) if (s > best) { newBests++; best = s; }
+  const post = scores.slice(BEST.warmup), half = post.length >> 1;
+  const sorted = [...scores].sort((x, y) => x - y);
+  return {
+    rate: newBests / post.length,
+    trend: mean(post.slice(half)) / Math.max(mean(post.slice(0, half)), 1e-9),
+    median: sorted[sorted.length >> 1],
+  };
+}
 const SEETA_PER_S = 1 / 30;      // I: director-offered Seeta rings per second of run time, at most
 const perMin = (rs, key) => (60 * sum(rs, (r) => r[key])) / Math.max(sum(rs, (r) => r.duration), 1e-9);
 
@@ -424,6 +444,7 @@ for (const seed of SEEDS) {
   const check = (id, label, ok) => { checks.push([id, label, ok]); overview.push([seed, id, ok]); };
   console.log(`\n================ SEED ${seed} ================`);
 
+  const trendPool = {}, trendPoolClassic = {}; // bot index -> summed scores, post-warm-up halves
   for (const policy of POLICIES) {
     const run = (skill, s, classic) => summarise(skill, runBot(skill, s + seed, { classic, policy }));
     const personal = BOTS.map(([skill, s]) => run(skill, s, false));
@@ -496,6 +517,20 @@ for (const seed of SEEDS) {
       check('H', tag(`bot ${personal[i].skill}: mean storm risk ${f(h)} × classic proposal ≥ ${RATIO.stormRiskMin}`), h >= RATIO.stormRiskMin);
     }
 
+    // K. New bests stay rare for capable players: after the warm-up, a new personal best in
+    // ≤ BEST.rate of runs (per policy); the score trend is judged below, pooled over policies.
+    for (const i of [1, 2]) {
+      const a = bestStats(personal[i].runs), c = bestStats(classic[i].runs);
+      console.log(`  bot ${personal[i].skill} scores: new-best rate ${f(a.rate)} (Classic ${f(c.rate)}), trend ×${f(a.trend)} (Classic ×${f(c.trend)}), median ${f(a.median, 0)} (Classic ${f(c.median, 0)})`);
+      check('K', tag(`bot ${personal[i].skill}: new bests in ${f(a.rate)} of runs ${BEST.warmup + 1}–${RUNS} ≤ ${BEST.rate}`), a.rate <= BEST.rate);
+      for (const [pool, runs] of [[trendPool, personal[i].runs], [trendPoolClassic, classic[i].runs]]) {
+        const p = (pool[i] ??= { early: 0, late: 0 });
+        const post = runs.slice(BEST.warmup).map((r) => r.score), half = post.length >> 1;
+        p.early += sum(post.slice(0, half), (s) => s);
+        p.late += sum(post.slice(half), (s) => s);
+      }
+    }
+
     // J. A ship that never moves collects no rings once personalisation is on.
     const parkedRings = sum(idle.runs, (x) => x.ringsTakenPersonal);
     check('J', tag(`non-steering bot: rings collected while personalising ${parkedRings} = 0 (Adaptive ${f(perMin(idle.runs, 'ringsTaken'))}/min vs Classic ${f(perMin(idleClassic.runs, 'ringsTaken'))}/min)`), parkedRings === 0);
@@ -506,11 +541,18 @@ for (const seed of SEEDS) {
     check('I', tag(`offered Seeta rings ≤ 1 per 30 s in every run${over.length ? ` (over: ${over.slice(0, 3).join('; ')})` : ''}`), over.length === 0);
   }
 
+  // K (trend): later half of the post-warm-up scores ÷ earlier half, pooled over all policies.
+  for (const i of [1, 2]) {
+    const t = trendPool[i].late / Math.max(trendPool[i].early, 1e-9);
+    const tc = trendPoolClassic[i].late / Math.max(trendPoolClassic[i].early, 1e-9);
+    check('K', `bot ${BOTS[i][0]}: score trend over all policies ×${f(t)} ≤ ${BEST.trend} (Classic ×${f(tc)})`, t <= BEST.trend);
+  }
+
   console.log('\n  ACCEPTANCE');
   for (const [id, label, ok] of checks) console.log(`    ${ok ? 'PASS' : 'FAIL'}  ${id}  ${label}`);
 }
 
-console.log('\nOVERVIEW (seed × check: failures / total; E–J cover all Shakti policies)');
+console.log('\nOVERVIEW (seed × check: failures / total; E–K cover all Shakti policies)');
 console.log(`  seed  ${CHECK_IDS.map((c) => c.padStart(5)).join('')}`);
 for (const seed of SEEDS) {
   const cells = CHECK_IDS.map((id) => {
