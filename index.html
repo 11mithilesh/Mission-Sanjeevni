@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <title>Mission Sanjeevni</title>
+  <meta name="description" content="Mission Sanjeevni — Hanuman's flight to bring the Sanjeevni herb to Lakshman." />
+  <meta name="theme-color" content="#0b0217" />
+  <meta property="og:title" content="Mission Sanjeevni" />
+  <meta property="og:description" content="Hanuman's flight to bring the Sanjeevni herb to Lakshman." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%23ffd166'/%3E%3Cstop offset='1' stop-color='%23ff3fd2'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='%230b0217'/%3E%3Ccircle cx='32' cy='30' r='17' fill='url(%23g)'/%3E%3Cpath d='M8 46h48M14 52h36' stroke='%2346f1ff' stroke-width='3'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Noto+Sans+Devanagari:wght@400;600;700&family=Orbitron:wght@600;900&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <div id="hud" class="hidden">
+    <div class="hud-left">
+      <div class="label">Score</div>
+      <div id="score">0</div>
+      <div id="mult" class="mult"></div>
+    </div>
+    <div class="hud-right">
+      <div class="label devnagari kavach-label">श्री राम कवच</div>
+      <div class="bar"><div id="shield"></div></div>
+      <div class="label small devnagari shakti-label">माँ सीता शक्ति</div>
+      <button id="power" class="bar shakti-control" aria-label="Use Shakti power to destroy obstacles" title="Destroy obstacles (X or double-click)" disabled>
+        <div id="power-fill"></div>
+      </button>
+      <div class="label small">Best <span id="best-hud">0</span></div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <div id="flash"></div>
+
+  <div id="menu" class="panel mission-panel">
+    <section class="mission-story" aria-labelledby="mission-title">
+      <p class="mission-kicker">AN EPIC FLIGHT...</p>
+      <h1 id="mission-title" class="mission-title">MISSION<span>SANJEEVNI</span></h1>
+      <blockquote class="mission-verse devnagari-text" lang="hi">लाय सञ्जीवन लखन जियाये।<br>श्री रघुबीर हरषि उर लाये॥</blockquote>
+      <p class="mission-intro">Lakshman lies gravely wounded. Hanuman must cross the skies to bring back the Sanjeevni Booti from Dunagiri Parvat on Sushen Vaidya's prescription.</p>
+      <p class="mission-story-copy">Before he sets out, Shri Ram grants him the <strong>Ram Kavach</strong> to endure the dangers ahead, and Maa Sita blesses him with <strong>Seeta Shakti</strong> to clear his path.</p>
+      <div class="mission-blessings">
+        <!-- <div><span class="blessing-mark kavach-mark">✦</span><p><strong>Ram Kavach</strong><br>Hold strong through danger.</p></div>
+        <div><span class="blessing-mark shakti-mark">⚡</span><p><strong>Seeta Shakti</strong><br>Break through obstacles.</p></div> -->
+      </div>
+    </section>
+    <aside class="mission-launch" aria-label="Mission launch and flight guide">
+      <p class="launch-kicker">YOUR MISSION</p>
+      <p class="mission-objective">Fly fast. Gather strength. Bring Sanjeevni home.</p>
+      <button id="start" class="primary" disabled>Loading…</button>
+      <h2 class="flight-guide-title">FLIGHT GUIDE</h2>
+      <ul class="legend">
+        <li><i class="dot gold"></i>Glowing fruits build your score multiplier</li>
+        <li><i class="dot cyan"></i>Fly through gates to restores your Kavach and Shakti.</li>
+        <li><i class="dot pink"></i>Obstacles drain your shield; use Seeta Shakti to clear them.</li>
+      </ul>
+      <p class="mission-blessing devnagari-text" lang="hi">॥ जय श्री राम ॥</p>
+      <div class="controls">Steer: mouse, touch, WASD or arrows<br>Boost: hold left-click<br>Shakti: X, double-click or शक्ति button<br>Collect शक्ति rings to refill · P / Esc to pause · M to mute</div>
+      <div class="best">Best: <span id="best-menu">0</span></div>
+    </aside>
+  </div>
+
+  <div id="pause" class="panel hidden">
+    <h2>Paused</h2>
+    <button id="resume" class="primary devnagari-text">जय श्री राम</button>
+  </div>
+
+  <div id="over" class="panel hidden">
+    <h2>Try Again!!</h2>
+    <div class="final" id="final-score">0</div>
+    <div id="new-best" class="new-best hidden">New best!</div>
+    <div class="best">Best: <span id="final-best">0</span></div>
+    <button id="restart" class="primary devnagari-text">जय श्री राम</button>
+  </div>
+
+  <button id="mute" class="icon-btn" aria-label="Toggle sound" title="Sound (M)">♪</button>
+
+  <noscript><div class="panel">Mission Sanjeevni needs JavaScript and WebGL.</div></noscript>
+  <script type="module" src="main.js"></script>
+</body>
+</html>
