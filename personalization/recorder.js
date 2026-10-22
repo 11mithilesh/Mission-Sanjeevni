@@ -6,7 +6,7 @@
 
 export const EVENT_TYPES = [
   'run_start', 'run_end', 'wave_spawn', 'obstacle_pass', 'fruit', 'gate',
-  'shakti_used', 'boost', 'ship_sample',
+  'shakti_used', 'obstacle_clear', 'boost', 'ship_sample',
 ];
 
 export function createRecorder({ capacity = 2000, persistSummaries = false } = {}) {

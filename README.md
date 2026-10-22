@@ -86,11 +86,11 @@ Only in your browser: one `localStorage` entry, `mission-sanjeevni-player-v1` (a
 
 **How to reset it**
 
-Click **Reset learning** on the start or game-over screen. You can also clear this site's data in your browser settings. Best scores are kept separately and are not reset. Adaptive and Classic mode each keep their own best, and the screens show the one for the selected mode.
+Clear this site's data in your browser settings. This also clears your best score.
 
-**Classic mode**
+**How often it is used**
 
-Tick **Classic mode** on the start or game-over screen to play the original game with every value hand-tuned. While Classic mode is on, nothing is recorded or learned. The setting is remembered.
+Storm and orb placement is personalised in every game. Everything else (speed, spacing, ramp, wave types, rings) is personalised in only one game in every 30; in the other 29 it plays like the original hand-tuned game (the game still learns from them). In a personalised game, those settings switch back to the original once your score gets near your best (a point drawn within ±10,312 of it). The game shows one best score across all games.
 
 **Debug overlay**
 

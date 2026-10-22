@@ -1,16 +1,18 @@
 /* =========================================================
-   Wave bandit — Thompson sampling over wave types.
+   Wave bandit — per-wave-type hit statistics.
    Each arm keeps Beta(hits, clean) evidence on "this wave
-   type hit the player". We pick the arm whose SAMPLED hit
-   probability is closest to the director's target risk, with
-   10% uniform exploration. Evidence is decayed once it exceeds
-   ~60 effective samples so the posterior keeps adapting.
+   type hit the player". Waves are drawn from the classic mix
+   tilted toward or away from risky types so the mix's expected
+   hit rate matches the director's target (relative to the
+   classic mix's own rate). Every type keeps a share, which is
+   the exploration. Evidence is decayed once it exceeds ~60
+   effective samples so the estimates keep adapting.
    ========================================================= */
 
 export const ARMS = ['wall', 'scatter', 'snake', 'gate'];
 export const PRIOR = { a: 1, b: 4 };     // mild: ~20% hit rate, worth 5 samples
 export const MAX_EVIDENCE = 60;
-export const EXPLORE = 0.1;
+export const TILT_LIMIT = 8;
 
 export function defaultBandit() {
   return Object.fromEntries(ARMS.map((arm) => [arm, { a: PRIOR.a, b: PRIOR.b }]));
@@ -24,14 +26,32 @@ export function updateBandit(bandit, arm, hit) {
   if (total > MAX_EVIDENCE) { p.a *= MAX_EVIDENCE / total; p.b *= MAX_EVIDENCE / total; }
 }
 
-export function chooseArm(bandit, targetRisk, allowed = ARMS, rng = Math.random) {
-  if (rng() < EXPLORE) return allowed[Math.floor(rng() * allowed.length)];
-  let best = allowed[0], bestGap = Infinity;
-  for (const arm of allowed) {
-    const gap = Math.abs(sampleBeta(bandit[arm].a, bandit[arm].b, rng) - targetRisk);
-    if (gap < bestGap) { bestGap = gap; best = arm; }
+// Tilts a baseline mix (e.g. the classic one) so its expected hit rate is `target`:
+// p(arm) ∝ base[arm] × exp(λ × mean[arm]), with λ found by bisection within ±TILT_LIMIT.
+// At target = the baseline's own rate the mix is unchanged; every arm keeps some share.
+export function tiltedMix(bandit, base, target, allowed = ARMS) {
+  const means = allowed.map((arm) => banditMean(bandit[arm]));
+  const weightsAt = (lambda) => allowed.map((arm, i) => (base[arm] ?? 0) * Math.exp(lambda * means[i]));
+  const rateAt = (lambda) => {
+    const w = weightsAt(lambda);
+    const total = w.reduce((s, v) => s + v, 0) || 1;
+    return w.reduce((s, v, i) => s + v * means[i], 0) / total;
+  };
+  let lo = -TILT_LIMIT, hi = TILT_LIMIT;
+  for (let i = 0; i < 40; i++) {
+    const mid = (lo + hi) / 2;
+    if (rateAt(mid) < target) lo = mid; else hi = mid;
   }
-  return best;
+  const w = weightsAt((lo + hi) / 2);
+  const total = w.reduce((s, v) => s + v, 0) || 1;
+  return Object.fromEntries(allowed.map((arm, i) => [arm, w[i] / total]));
+}
+
+export function chooseArm(bandit, base, target, allowed = ARMS, rng = Math.random) {
+  const mix = tiltedMix(bandit, base, target, allowed);
+  let pick = rng();
+  for (const arm of allowed) if ((pick -= mix[arm]) < 0) return arm;
+  return allowed[allowed.length - 1];
 }
 
 export const banditMean = (p) => p.a / (p.a + p.b);

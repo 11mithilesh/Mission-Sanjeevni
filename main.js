@@ -7,7 +7,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createDirector } from './personalization/director.js';
 import { createDebugOverlay } from './personalization/debug-overlay.js';
 import { createBestScoreStore } from './personalization/best-score.js';
-import { classifyObstaclePass } from './personalization/obstacles.js';
+import { classifyObstaclePass, classifyShaktiClear } from './personalization/obstacles.js';
 
 /* =========================================================
    NEON DRIFT — a synthwave flyer in Three.js
@@ -19,7 +19,7 @@ const ui = {
   hud: $('hud'), score: $('score'), mult: $('mult'), shield: $('shield'), bestHud: $('best-hud'),
   menu: $('menu'), over: $('over'), pause: $('pause'), start: $('start'), restart: $('restart'),
   resume: $('resume'), finalScore: $('final-score'), finalBest: $('final-best'), newBest: $('new-best'),
-  bestMenu: $('best-menu'), flash: $('flash'), toast: $('toast'), mute: $('mute'),
+  bestMenu: $('best-menu'), flash: $('flash'), toast: $('toast'), hint: $('hint'), mute: $('mute'),
   power: $('power'), powerFill: $('power-fill'),
 };
 
@@ -837,6 +837,18 @@ ship.position.set(0, 3.6, 0);
 ship.visible = false;
 scene.add(ship);
 
+// Light yellow circle around Hanuman while he blinks after a hit. It is a child of the ship,
+// so it blinks with him; it shows only after a hit (not during the start-of-run grace).
+const hitAura = new THREE.Group();
+const auraMaterial = (opacity) => new THREE.MeshBasicMaterial({
+  color: 0xfff1a8, transparent: true, opacity, side: THREE.DoubleSide,
+  blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
+});
+hitAura.add(new THREE.Mesh(new THREE.RingGeometry(1.55, 1.75, 64), auraMaterial(0.9)));
+hitAura.add(new THREE.Mesh(new THREE.CircleGeometry(1.55, 64), auraMaterial(0.12)));
+hitAura.visible = false;
+ship.add(hitAura);
+
 const _v = new THREE.Vector3();
 const ENGINE_LOCAL = new THREE.Vector3(0, 0, -0.9);
 let playerLoaded = false;
@@ -1184,6 +1196,9 @@ function spawn(type, x, y, z, variant = 'ram') {
   e.baseY = y;
   e.phase = Math.random() * Math.PI * 2;
   e.passed = false;
+  e.crossD2 = undefined; // pooled entities: clear the previous life's crossing record
+  e.crossInvuln = false;
+  e.offered = false;     // ring offered by the director: never scores (see onGate)
   e.waveId = null;    // which wave spawned it, for outcome attribution
   e.features = null;  // risk features at placement time (obstacles only)
   e.side = 0;
@@ -1238,14 +1253,20 @@ function clearObstacles() {
   }
   state.powerCharges--;
   const waveIds = [];
+  const clears = []; // per storm still ahead: was it an imminent threat?
+  const sp = ship.position;
   for (let i = entities.length - 1; i >= 0; i--) {
     const obstacle = entities[i];
     if (obstacle.type !== 'crystal') continue;
     if (!obstacle.passed && obstacle.waveId !== null) waveIds.push(obstacle.waveId);
+    if (!obstacle.passed) {
+      const p = obstacle.mesh.position;
+      clears.push(classifyShaktiClear({ x: p.x, y: p.y, z: p.z - sp.z, rx: obstacle.rx, ry: obstacle.ry }, sp, state.speed));
+    }
     burst(obstacle.mesh.position, 36, 12, [0.55, 1.5, 2.4], 0.8);
     removeAt(i);
   }
-  director.onEvent({ type: 'shakti_used', threats: cleared, waveIds });
+  director.onEvent({ type: 'shakti_used', threats: cleared, waveIds, clears });
   updatePowerBar();
   toast('OBSTACLES CLEARED', '#46f1ff');
 }
@@ -1302,7 +1323,7 @@ function waveGate(d, wave) {
   const { x, y } = director.placeRing({
     x: rand(-5.5, 5.5), y: rand(2.4, 5.6), z, xRange: [-5.5, 5.5], yRange: [2.4, 5.6], ship: shipCtx(), speed: state.speed,
   }, variant);
-  ring(x, y, z, variant);
+  ring(x, y, z, variant).offered = wave.offered;
   const { x: x0, y: y0 } = director.fruitPath({ x: rand(-7, 7), y: rand(1.8, 6.4), xRange: [-7, 7], yRange: [1.8, 6.4] });
   for (let i = 0; i < 4; i++) {
     const k = i / 4;
@@ -1386,24 +1407,40 @@ const state = {
   invuln: 0,
   shake: 0,
 };
-// Adaptive and Classic keep separate best scores; the displays follow the selected mode.
+// There is no Classic mode switch any more: a player who had turned it on is moved back to
+// the default (personalised play is still limited to 1 game in 30; see the director).
+if (director.model.classic) director.setClassic(false);
 const selectedMode = () => (director.model.classic ? 'classic' : 'adaptive');
-function showBest(mode = selectedMode()) {
-  const best = store.get(mode).toLocaleString();
-  const label = mode === 'classic' ? 'Classic' : 'Adaptive';
+// Scores are still saved per mode, but the game shows one overall best: the higher of both.
+const overallBest = () => Math.max(store.get('adaptive'), store.get('classic'));
+function showBest() {
+  const best = overallBest().toLocaleString();
   ui.bestMenu.textContent = best;
   ui.bestHud.textContent = best;
   ui.finalBest.textContent = best;
-  document.querySelectorAll('.best-mode').forEach((el) => { el.textContent = label; });
 }
 state.runMode = selectedMode();
-state.best = store.get(state.runMode);
+state.best = overallBest();
 showBest();
 
 const multiplier = () => Math.min(8, 1 + Math.floor(state.combo / 4));
 function updatePowerBar() {
   ui.powerFill.style.width = `${(state.powerCharges / 3) * 100}%`;
   ui.power.dataset.level = String(state.powerCharges);
+}
+
+// Once per run, when the first storm comes into view: how to use Shakti.
+const HINT_Z = -130; // roughly where storms emerge from the fog
+let hintShown = false;
+function showHint() {
+  hintShown = true;
+  ui.hint.textContent = 'Click twice to destroy!!';
+  ui.hint.classList.remove('show');
+  void ui.hint.offsetWidth; // restart animation
+  ui.hint.classList.add('show');
+}
+function hideHint() {
+  ui.hint.classList.remove('show');
 }
 
 function toast(text, color) {
@@ -1421,15 +1458,19 @@ function startGame() {
   sfx.start();
   clearEntities();
   gateCount = 0;
-  director.onEvent({ type: 'run_start' }); // fixes this run's personalisation level first
+  // Fixes this run's personalisation level first; `best` sets where it switches to Classic.
+  director.onEvent({ type: 'run_start', best: overallBest() });
   resetRiverStyle();
   nextPlaceIndex = 0;
   showPlaceName();
   nextRiverChange = director.regionInterval();
-  state.runMode = selectedMode(); // a toggle on the game-over panel can't re-file this run
-  state.best = store.get(state.runMode);
-  showBest(state.runMode);
+  state.runMode = selectedMode();
+  state.best = overallBest();
+  showBest();
   Object.assign(state, { mode: 'playing', score: 0, shield: 100, combo: 0, powerCharges: 3, runTime: 0, dist: 0, nextSpawn: 40, invuln: 1, shake: 0 });
+  hintShown = false;
+  hideHint();
+  hitAura.visible = false;
   updatePowerBar();
   ui.power.disabled = false;
   ship.visible = true;
@@ -1447,6 +1488,7 @@ function startGame() {
 function gameOver() {
   state.mode = 'dying';
   ui.power.disabled = true;
+  hideHint();
   burst(ship.position, 160, 16, [2.4, 0.6, 2.2], 1.4);
   burst(ship.position, 80, 9, [0.4, 2.0, 2.6], 1.2);
   ship.visible = false;
@@ -1461,7 +1503,7 @@ function gameOver() {
     state.mode = 'over';
     ui.hud.classList.add('hidden');
     ui.finalScore.textContent = final.toLocaleString();
-    showBest(state.runMode);
+    showBest();
     ui.newBest.classList.toggle('hidden', !isBest);
     ui.over.classList.remove('hidden');
     ui.restart.focus();
@@ -1490,6 +1532,7 @@ function onHit(e) {
   state.shield -= 34;
   state.combo = 0;
   state.invuln = 1.2;
+  hitAura.visible = true;
   state.shake = 0.7;
   burst(e.mesh.position, 70, 12, [2.4, 0.4, 2.0], 0.9);
   sfx.hit();
@@ -1507,10 +1550,25 @@ function onCollect(e) {
 }
 
 function onGate(e) {
-  state.combo += 2;
+  if (e.offered) {
+    // Director-offered rings never score or build combo: a कवच rescue only repairs the
+    // shield, a Seeta refill only restores a Shakti charge.
+    burst(e.mesh.position, 90, 10, [0.4, 2.0, 2.6], 0.9);
+    sfx.gate();
+    if (e.variant === 'ram' && state.shield < 100) {
+      state.shield = Math.min(100, state.shield + 15);
+      toast('KAVACH REPAIRED', '#ffd166');
+    } else if (e.variant === 'seeta' && state.powerCharges < 3) {
+      state.powerCharges++;
+      updatePowerBar();
+      toast('SHAKTI REFILLED', '#ff263f');
+    }
+    return;
+  }
   const shieldBefore = state.shield;
   state.shield = Math.min(100, state.shield + 15);
   const kavachRepaired = state.shield > shieldBefore;
+  state.combo += 2;
   const pts = 100 * multiplier();
   state.score += pts;
   burst(e.mesh.position, 90, 10, [0.4, 2.0, 2.6], 0.9);
@@ -1580,25 +1638,6 @@ window.addEventListener('pagehide', () => {
   director.save();
 });
 
-// Classic mode (no personalisation) and Reset learning, shown on the menu and game-over panels.
-const classicToggles = document.querySelectorAll('.classic-mode');
-classicToggles.forEach((box) => {
-  box.checked = director.model.classic;
-  box.addEventListener('change', () => {
-    director.setClassic(box.checked);
-    classicToggles.forEach((other) => { other.checked = box.checked; });
-    showBest();
-  });
-});
-document.querySelectorAll('.reset-learning').forEach((button) => {
-  button.addEventListener('click', () => {
-    if (!confirm('Forget everything the game has learned about how you fly?')) return;
-    director.reset();
-    button.textContent = 'Learning reset ✓';
-    setTimeout(() => { button.textContent = 'Reset learning'; }, 2000);
-  });
-});
-
 ui.start.addEventListener('click', startGame);
 ui.restart.addEventListener('click', startGame);
 ui.resume.addEventListener('click', () => setPaused(false));
@@ -1644,6 +1683,7 @@ function updateShip(dt, t) {
   if (state.invuln > 0) {
     state.invuln -= dt;
     ship.visible = Math.floor(state.invuln * 14) % 2 === 0 || state.invuln <= 0;
+    if (state.invuln <= 0) hitAura.visible = false;
   } else {
     ship.visible = true;
   }
@@ -1668,17 +1708,15 @@ function updateEntities(dt, dz, t) {
 
     if (e.type === 'crystal') {
       m.rotation.y += e.spin * dt;
+      if (playing && !hintShown && zNew - sp.z > HINT_Z) showHint();
       if (playing) {
         const dx = (m.position.x - sp.x) / (e.rx + 1.0);
         const dy = (m.position.y - sp.y) / (e.ry + 0.3);
         const dzn = zc / (e.rx + 0.8);
         const d2 = dx * dx + dy * dy + dzn * dzn; // < 1 means inside the collision ellipsoid
         if (state.invuln <= 0 && d2 < 1) { reportObstacle(e, 'hit'); onHit(e); removeAt(i); continue; }
-        const outcome = classifyObstaclePass({ zc, rx: e.rx, d2, passed: e.passed });
-        if (outcome !== null) {
-          e.passed = true;
-          reportObstacle(e, outcome);
-        }
+        const outcome = classifyObstaclePass(e, { zc, rx: e.rx, d2, invuln: state.invuln });
+        if (outcome !== null) reportObstacle(e, outcome);
       }
     } else if (e.type === 'orb') {
       const fruit = m.children[m.userData.fruitIndex];
@@ -1706,7 +1744,7 @@ function updateEntities(dt, dz, t) {
         e.passed = true;
         const dx = sp.x - m.position.x, dy = sp.y - m.position.y;
         const through = dx * dx + dy * dy < 2.1 * 2.1;
-        director.onEvent({ type: 'gate', passed: through, variant: e.variant });
+        director.onEvent({ type: 'gate', passed: through, variant: e.variant, offered: e.offered });
         if (through) onGate(e);
       }
     }
@@ -1812,7 +1850,8 @@ function frame() {
 
   if (state.mode === 'playing') {
     state.dist += dz;
-    state.score += dz * 0.1;
+    // Distance scores at Classic speed: being pushed faster makes the game harder, not richer.
+    state.score += (dz / director.speedMultiplier()) * 0.1;
     if (state.dist >= state.nextSpawn) {
       spawnWave();
       state.nextSpawn = state.dist + THREE.MathUtils.lerp(70, 34, difficulty()) * director.spawnGapMultiplier();
@@ -1823,7 +1862,7 @@ function frame() {
   updateScenery(dt, dz);
   updateShip(dt, t);
   updateEntities(dt, dz, t);
-  director.tick(dt, { playing: state.mode === 'playing', ship: shipCtx(), target, boost: input.boost });
+  director.tick(dt, { playing: state.mode === 'playing', ship: shipCtx(), target, boost: input.boost, score: state.score });
   debugOverlay.update(dt);
   updateParticles(dt, dz);
   updateStreaks(dz);

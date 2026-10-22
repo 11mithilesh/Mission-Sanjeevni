@@ -9,6 +9,33 @@
 export const HEAT_COLS = 5;
 export const HEAT_ROWS = 3;
 export const BOUNDS = { x: 9, yMin: 0.9, yMax: 7.2 }; // mirrors main.js
+export const RUN_HISTORY = 15;
+// Struggling: each of the last STRUGGLE.recent runs is shorter than STRUGGLE.share × the
+// median of the recorded runs (needs at least STRUGGLE.minRuns of history).
+export const STRUGGLE = { recent: 3, share: 0.6, minRuns: 6 };
+// Engagement: a ship moving at >= ACTIVE.speed counts as steering; `share` of time moving
+// counts as fully engaged (also the starting value). EWMA over ~20 s of 0.2 s samples.
+export const ACTIVE = { speed: 2, share: 0.2, alpha: 0.01 };
+export const engagement = (p) => Math.min(1, p.activity / ACTIVE.share);
+
+// How the player uses Shakti. Judged per USE (did it clear an imminent threat?), not per
+// storm: one use clears every storm on screen, so even a pure panic use is mostly far clears
+// by storm count (the per-storm clearThreatShare is kept for reference).
+// 'panic'       mostly uses that clear an imminent threat (struggling: slight easing via
+//               tension, base refills);
+// 'convenience' mostly uses with no imminent threat, used often or with many storms on
+//               screen (fewer refill offers, the controller pushes harder);
+// 'mixed' otherwise, 'unknown' until enough uses are seen.
+export const SHAKTI_STYLE = { minUses: 5, panicShare: 0.5, convenienceShare: 0.25, usesPerMin: 0.5, threat: 4 };
+export function shaktiStyle(p) {
+  const s = SHAKTI_STYLE;
+  if (p.shaktiUses < s.minUses) return 'unknown';
+  if (p.threatUseShare >= s.panicShare) return 'panic';
+  if (p.threatUseShare < s.convenienceShare && (p.shaktiPerMin >= s.usesPerMin || p.shaktiThreat >= s.threat)) {
+    return 'convenience';
+  }
+  return 'mixed';
+}
 
 export function defaultProfile() {
   return {
@@ -20,12 +47,24 @@ export function defaultProfile() {
     reach: 6,                // typical distance travelled in ~1 s when moving
     recentHitRate: 0.15,     // per-obstacle hit rate
     runLength: 60,           // typical run duration (s)
+    // Last RUN_HISTORY run durations (s), newest first; 0 = no run yet. Fixed length so
+    // storage's type check keeps it.
+    recentRuns: new Array(RUN_HISTORY).fill(0),
+    recentScores: new Array(RUN_HISTORY).fill(0), // final scores, same layout as recentRuns
+    bestScore: 0,            // best Adaptive score seen by the director
     boost: 0.1,              // fraction of time spent boosting
+    activity: ACTIVE.share,  // fraction of time the ship is moving (steering engagement)
     shaktiThreat: 3,         // obstacles on screen when Shakti is used
     shaktiPerMin: 0.5,
+    clearThreatShare: 0.5,   // share of Shakti-cleared storms that were imminent threats
+    shaktiClears: 0,         // Shakti-cleared storms seen
+    threatUseShare: 0.5,     // share of Shakti uses that cleared at least one imminent threat
+    shaktiUses: 0,           // Shakti uses seen with clear outcomes (gates shaktiStyle)
     themes: {},              // storm theme -> hit rate
     observations: 0,         // obstacle outcomes seen (drives personalisation fade-in)
     runs: 0,
+    blockGame: 0,            // Rule 2: games played in the current block of PERSONAL_BLOCK
+    blockSlot: 0,            // Rule 2: which game of the current block is personalised
   };
 }
 
@@ -48,6 +87,25 @@ export function heatCellCenter(index) {
 
 // +1 → obstacles to the player's right are harder to dodge, −1 → left.
 export const weakSide = (p) => Math.tanh(4 * (p.hitRight - p.hitLeft));
+
+const median = (xs) => {
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+};
+
+export function isStruggling(p) {
+  const runs = p.recentRuns.filter((d) => d > 0);
+  if (runs.length < STRUGGLE.minRuns) return false;
+  return runs.slice(0, STRUGGLE.recent).every((d) => d < STRUGGLE.share * median(runs));
+}
+
+// Median of the recorded Adaptive scores (null until GOVERNOR_MIN_RUNS are recorded).
+export const GOVERNOR_MIN_RUNS = 5;
+export function scoreMedian(p) {
+  const scores = p.recentScores.filter((s) => s > 0);
+  return scores.length < GOVERNOR_MIN_RUNS ? null : median(scores);
+}
 
 // Occupancy-weighted mean position: where the player tends to sit.
 export function preferredPosition(p) {
@@ -76,6 +134,11 @@ export function createProfileTracker(profile) {
         case 'run_end':
           p.runs++;
           p.runLength = ewma(p.runLength, e.duration, p.runs === 1 ? 0.5 : 0.2);
+          p.recentRuns.pop();
+          p.recentRuns.unshift(Math.max(e.duration, 0.001));
+          p.recentScores.pop();
+          p.recentScores.unshift(Math.max(e.score ?? 0, 0));
+          p.bestScore = Math.max(p.bestScore, e.score ?? 0);
           p.shaktiPerMin = ewma(p.shaktiPerMin, runShakti / Math.max(e.duration / 60, 0.25), 0.2);
           break;
         case 'wave_spawn':
@@ -94,6 +157,14 @@ export function createProfileTracker(profile) {
         case 'shakti_used':
           runShakti++;
           p.shaktiThreat = ewma(p.shaktiThreat, e.threats ?? 0, 0.2);
+          if (e.clears?.length) {
+            p.shaktiUses++;
+            p.threatUseShare = ewma(p.threatUseShare, e.clears.includes('cleared_threat') ? 1 : 0, 0.15);
+          }
+          break;
+        case 'obstacle_clear':
+          p.shaktiClears++;
+          p.clearThreatShare = ewma(p.clearThreatShare, e.outcome === 'cleared_threat' ? 1 : 0, 0.1);
           break;
         case 'ship_sample': {
           const speed = Math.hypot(e.vx, e.vy);
@@ -104,6 +175,7 @@ export function createProfileTracker(profile) {
             pendingWaveAt = null;
           }
           lastSpeed = speed;
+          p.activity = ewma(p.activity, speed >= ACTIVE.speed ? 1 : 0, ACTIVE.alpha);
           // Lanes: decayed occupancy heatmap.
           const cell = heatCell(e.x, e.y);
           for (let i = 0; i < p.heat.length; i++) p.heat[i] *= 0.998;

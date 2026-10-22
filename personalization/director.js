@@ -13,19 +13,32 @@
    Objective: the shield takes 3 hits, so hits are far too
    rare and too costly to steer by. Tension comes from near
    misses (and calms on clean waves); the controller aims it
-   at `targetTension`. A hit only engages a brake that cuts
-   the risk budget and eases difficulty for a while. The
-   resulting "felt" level drives both the in-run controller
-   and the between-run `skill` update.
+   at `targetTension`. A hit only engages a fixed 8 s brake
+   that eases difficulty. The resulting "felt" level drives
+   both the in-run controller and the between-run `skill`
+   update.
+
+   Difficulty is relative to Classic: storms aim at the
+   classic proposal's risk × `riskMul` (never below its floor
+   × classic), walls keep the classic gap unless riskMul > 1,
+   and the wave mix targets riskMul × the classic mix's rate.
+   Speed, spacing and ramp go easier than Classic only for
+   players flagged as struggling (see profile.isStruggling),
+   who are also the only ones offered rescue कवच gates.
+   A personal-best governor stops easing and pushes hard once
+   a run's score passes the player's median, so new bests stay
+   rare. Seeta refills are offered sparingly (see SEETA); storms a
+   player clears with Shakti are classified as imminent
+   threats (tension, like a near miss) or far clears.
    ========================================================= */
 
 import { createStorage, SCHEMA_VERSION } from './storage.js';
 import { createRecorder } from './recorder.js';
 import {
-  defaultProfile, createProfileTracker, weakSide, heatCellCenter, BOUNDS,
+  defaultProfile, createProfileTracker, weakSide, heatCellCenter, isStruggling, engagement, shaktiStyle, scoreMedian, BOUNDS,
 } from './profile.js';
 import { defaultRisk, riskFeatures, predictRisk, updateRisk } from './models/risk.js';
-import { ARMS, defaultBandit, updateBandit, chooseArm } from './models/bandit.js';
+import { ARMS, defaultBandit, updateBandit, chooseArm, banditMean } from './models/bandit.js';
 import { predictShip, missProbability } from './models/reach.js';
 
 // Today's hand-tuned constants (cold start must reproduce these exactly).
@@ -37,27 +50,81 @@ export const FADE_OBSERVATIONS = 250;   // obstacle outcomes until fully persona
 export const CANDIDATES = 24;
 export const VISIBLE_Z = 130;            // roughly where storms emerge from the fog
 export const CLASSIC_SHARE = 0.1;        // share of decisions left classic at full confidence
-// targetRisk is a per-wave hit-probability budget: a ceiling the controller moves, not a goal.
+// Exactly one Adaptive game in each block of PERSONAL_BLOCK is personalised, at a random
+// position in the block; the rest play like Classic, except that storms and orbs are always
+// personalised (the director still learns from every game).
+// The position is saved with the profile, so the count carries across sessions.
+export const PERSONAL_BLOCK = 30;
+// In a personalised game, play switches to Classic once the score reaches a threshold drawn
+// uniformly within ± CLASSIC_SWITCH_WINDOW of the player's best score (drawn per game).
+export const CLASSIC_SWITCH_WINDOW = 10312;
+// riskMul scales storm risk RELATIVE to the classic proposal: each storm aims at
+// classicRisk × riskMul, and is never placed below riskMul's floor × classicRisk.
 export const LIMITS = {
-  speedMul: [0.75, 1.35], targetRisk: [0.02, 0.15], gapMul: [0.7, 1.5],
+  speedMul: [0.75, 1.35], riskMul: [0.7, 1.5], gapMul: [0.7, 1.5],
   targetTension: [0.15, 0.5], skill: [0.5, 2.5], follow: [5, 12], region: [30, 70],
 };
 // Tension controller tuning: gain per unit error, and max change per second.
 const CONTROL = {
   speedMul: { gain: 0.05, rate: 0.01 },
-  targetRisk: { gain: 0.013, rate: 0.002 },
+  riskMul: { gain: 0.08, rate: 0.012 },
   gapMul: { gain: -0.1, rate: 0.015 },
 };
 // Tension is near-miss driven; hits never add to it.
 const TENSION = { nearMiss: 0.12, clean: -0.03, decay: 0.15 };
-// Hit brake: each hit adds `hit` × (hits so far this run), so the last-life brake is strongest.
-// While engaged the controller can only ease; it releases once decayed below `release`.
-// `riskKeep` is the share of targetRisk's headroom above its floor kept on each hit.
-const BRAKE = { hit: 1, weight: 0.5, decay: 0.15, release: 0.15, riskKeep: 0.5 };
+// Hit brake: a hit eases at a fixed strength for `seconds` of play. Further hits restart the
+// timer; they never extend or strengthen it. While engaged the controller can only ease.
+const BRAKE = { seconds: 8, weight: 0.5 };
+// Pushing harder runs at this share of the easing rate. Near-miss tension sits below target
+// for most players, so with symmetric rates the controller settles where half of play is
+// braked (a hit every 2 × BRAKE.seconds), far harder than Classic. At 1/4 it settles at
+// 20% braked: a hit every ~40 s. Players hit more often than that in Classic are eased;
+// players hit less often are pushed.
+const PUSH_SHARE = 1 / 4;
 const SKILL_RATE = 0.25; // log-skill change per run at a fully saturated controller push
+const RESCUE = { interval: 30, shield: 40 }; // s of run time per rescue gate; shield at or below
+// Director-offered Seeta Shakti refills: only at 0 charges, one in flight at a time, and at
+// least `cooldown` s of run time between offers (so never more than 1 per 30 s).
+// Shakti style (profile.shaktiStyle): convenience users (mostly far clears) get refills
+// `convenienceSlower`× less often and a faster push; panic users (mostly imminent clears) keep
+// the base refill rate (no extra refills for struggling) and ease via threat-clear tension.
+const SEETA = { cooldown: 30, convenienceSlower: 3 };
+const CONVENIENCE_PUSH = 1.5;
+// Personal-best governor (see governor()): full strength at `nearBest` × the best score;
+// `err` is the tension error it imposes at full strength (saturates every knob).
+const GOVERNOR = { nearBest: 0.8, err: 0.2 };
+// Rings: `pass` mirrors main.js (a ring counts when the ship is within 2.1 of its centre).
+// While personalising, no ring is placed within `minOffset` of the ship, so collecting one
+// always takes a deliberate move.
+export const RING = { pass: 2.1, minOffset: 3.6 };
+
+// The spot within the ring area nearest `p` that is at least RING.minOffset from the ship
+// (p itself when it already is). Tries 16 directions around the ship.
+function awayFromShip(p, ctx) {
+  const { ship } = ctx;
+  if (Math.hypot(p.x - ship.x, p.y - ship.y) >= RING.minOffset) return p;
+  let best = null, bestD = Infinity;
+  for (let i = 0; i < 16; i++) {
+    const a = (i / 16) * Math.PI * 2;
+    for (const r of [RING.minOffset, RING.minOffset + 1.5, RING.minOffset + 3]) {
+      const x = clamp(ship.x + Math.cos(a) * r, ctx.xRange);
+      const y = clamp(ship.y + Math.sin(a) * r, ctx.yRange);
+      if (Math.hypot(x - ship.x, y - ship.y) < RING.minOffset) continue;
+      const d = Math.hypot(x - p.x, y - p.y);
+      if (d < bestD) { bestD = d; best = { x, y }; }
+    }
+  }
+  return best ?? p;
+}
 
 const clamp = (v, [a, b]) => Math.min(b, Math.max(a, v));
 const lerp = (a, b, k) => a + (b - a) * k;
+
+// Probabilities of today's spawnWave() selection (see chooseWave) at this point of a run.
+function classicArmWeights(runTime, d) {
+  const wall = runTime > 12 ? 0.18 + d * 0.1 : 0;
+  return { wall, scatter: 0.5 - wall, snake: 0.28, gate: 0.22 };
+}
 
 export function defaultModel() {
   return {
@@ -67,7 +134,7 @@ export function defaultModel() {
     risk: defaultRisk(),
     bandit: defaultBandit(),
     director: {
-      targetTension: 0.25, skill: 1, speedMul: 1, gapMul: 1, targetRisk: 0.06,
+      targetTension: 0.25, skill: 1, speedMul: 1, gapMul: 1, riskMul: 1,
     },
   };
 }
@@ -75,16 +142,26 @@ export function defaultModel() {
 export function createDirector({
   storage = createStorage({ defaults: defaultModel }), rng = Math.random,
   recorder = createRecorder({ persistSummaries: typeof indexedDB !== 'undefined' }),
+  personalBlock = PERSONAL_BLOCK,
 } = {}) {
   let { model, fresh } = storage.load();
-  // Models saved under older limits (e.g. targetRisk up to 0.45) are pulled into range.
-  for (const key of ['speedMul', 'targetRisk', 'gapMul', 'targetTension', 'skill']) {
+  // Models saved under older limits are pulled into range.
+  for (const key of ['speedMul', 'riskMul', 'gapMul', 'targetTension', 'skill']) {
     model.director[key] = clamp(model.director[key], LIMITS[key]);
   }
   let tracker = createProfileTracker(model.profile);
   let confidence = 0;
+  let placementConfidence = 0; // confidence before rules 1 and 2: storms and orbs use it
   let tension = 0;
   let brake = 0;
+  let struggling = false;  // frozen at run start from the profile's recent run lengths
+  let lastRescueAt = 0;    // run time of the last rescue gate (0: none before RESCUE.interval)
+  let lastSeetaAt = 0;     // run time of the last offered Seeta ring (0: none before the cooldown)
+  let seetaPending = false; // an offered Seeta ring is still in flight
+  let style = 'unknown';   // Shakti style, frozen at run start
+  let runScore = 0;        // this run's score so far (from tick ctx.score), for the governor
+  let classicAt = null;    // score at which this game switches to Classic (rule 1), or null
+  const govBoost = { speedMul: 0, riskMul: 0, gapMul: 0 }; // governor overlay, this run only
   let clock = 0;           // run time as seen by the director
   let sampleTimer = 0;
   let nextWaveId = 1;
@@ -95,6 +172,10 @@ export function createDirector({
 
   const D = () => model.director;
   const personalising = () => confidence > 0 && rng() < Math.min(confidence, 1 - CLASSIC_SHARE);
+  // Storms (incl. wall gaps) and orb trails stay personalised in every game: they use the
+  // fade-in confidence, which rules 1 and 2 never switch off.
+  const personalisingPlacement = () =>
+    placementConfidence > 0 && rng() < Math.min(placementConfidence, 1 - CLASSIC_SHARE);
   const learning = () => !model.classic;
 
   function computeConfidence() {
@@ -145,35 +226,75 @@ export function createDirector({
 
   // The one signal both the in-run controller and the between-run skill update steer by.
   // Without a brake it is the near-miss tension. With one it never reads below target
-  // (so the controller cannot push harder) and sits above it by the brake's strength.
+  // (so the controller cannot push harder) and sits a fixed BRAKE.weight above it.
   function felt() {
-    return brake > 0 ? Math.max(tension, D().targetTension) + BRAKE.weight * brake : tension;
+    return brake > 0 ? Math.max(tension, D().targetTension) + BRAKE.weight : tension;
   }
 
   function applyBrake() {
-    brake += BRAKE.hit * Math.max(1, run?.hits ?? 1);
-    if (confidence > 0) {
-      const [lo] = LIMITS.targetRisk;
-      D().targetRisk = lo + (D().targetRisk - lo) * BRAKE.riskKeep;
-    }
+    brake = BRAKE.seconds;
   }
 
+  // Easing below Classic speed, spacing or ramp is only for players flagged as struggling.
+  // Storm risk eases below Classic only as far as the player is steering: someone who
+  // doesn't move gets no easier storms (riskMul >= 1), an engaged player down to the floor.
+  function limit(key) {
+    const [lo, hi] = LIMITS[key];
+    if (key === 'riskMul') return [lerp(1, lo, engagement(model.profile)), hi];
+    if (struggling) return LIMITS[key];
+    if (key === 'speedMul' || key === 'skill') return [Math.max(lo, CLASSIC[key]), hi];
+    if (key === 'gapMul') return [lo, Math.min(hi, CLASSIC.gapMul)];
+    return LIMITS[key];
+  }
+
+  // A knob's step this frame as a share of its easing rate limit, signed toward "harder":
+  // in [-1, PUSH_SHARE]. Both the controller and the skill update use it.
+  function push(key, err, g = 0) {
+    const { gain, rate } = CONTROL[key];
+    const p = clamp(Math.abs(gain) * err / rate, [-1, 1]);
+    const share = lerp(PUSH_SHARE * (style === 'convenience' ? CONVENIENCE_PUSH : 1), 1, g);
+    return p > 0 ? p * share : p;
+  }
+
+  // Personal-best governor, 0…1: 0 until this run's score passes the player's median Adaptive
+  // score, rising to 1 at GOVERNOR.nearBest × their best. While it is above 0 the director never
+  // eases (the brake and calm are overridden) and offers no rings; at 1 it pushes at the full
+  // rate. A new best stays possible, but only against the hardest version of the game.
+  function governor() {
+    if (confidence <= 0 || !run) return 0;
+    const med = scoreMedian(model.profile);
+    if (med === null || runScore <= med) return 0;
+    const top = Math.max(GOVERNOR.nearBest * model.profile.bestScore, med * 1.05);
+    return clamp((runScore - med) / (top - med), [0, 1]);
+  }
+
+  // The learned (saved) knobs step as usual, except that while the governor is on they never
+  // ease. The governor's own push goes into a per-run overlay (govBoost) that is never saved
+  // and resets at run start, so a strong run does not make the next one harder.
   function stepController(dt) {
-    const err = D().targetTension - felt();
+    const g = governor();
+    const raw = D().targetTension - felt();
+    const err = g > 0 ? Math.max(raw, 0) : raw;
     for (const key of Object.keys(CONTROL)) {
       const { gain, rate } = CONTROL[key];
-      const step = Math.max(-rate * dt, Math.min(rate * dt, gain * err * dt));
-      D()[key] = clamp(D()[key] + step, LIMITS[key]);
+      D()[key] = clamp(D()[key] + Math.sign(gain) * push(key, err) * rate * dt, limit(key));
+      if (g > 0) {
+        const extra = Math.sign(gain) * push(key, g * GOVERNOR.err, 1) * rate * dt;
+        govBoost[key] = clamp(D()[key] + govBoost[key] + extra, limit(key)) - D()[key];
+      }
     }
   }
 
-  // How hard the controller is pushing toward "harder", in [-1, 1]: each knob's step as a
-  // share of its rate limit, averaged. Skill learns from this, so a brief brake spike
-  // weighs no more than it does in the controller.
+  // A knob's value in play: the learned value plus this run's governor overlay.
+  const knob = (key) => clamp(D()[key] + govBoost[key], limit(key));
+
+  // How hard the controller is pushing toward "harder", averaged over knobs. Skill learns
+  // from this, so a brief brake spike weighs no more than it does in the controller.
+  // The governor's push is left out: it caps scores, it is not evidence about the player.
   function drive() {
     const err = D().targetTension - felt();
     const keys = Object.keys(CONTROL);
-    return keys.reduce((s, k) => s + clamp(Math.abs(CONTROL[k].gain) * err / CONTROL[k].rate, [-1, 1]), 0) / keys.length;
+    return keys.reduce((s, k) => s + push(k, err), 0) / keys.length;
   }
 
   function endRun(e) {
@@ -188,7 +309,7 @@ export function createDirector({
     if (learning() && duration > 10 && run.engagedTime > 5) {
       // Skill: ramp faster next time when the controller spent the run pushing harder,
       // slower when it spent it easing or braking.
-      D().skill = clamp(D().skill * Math.exp(SKILL_RATE * meanDrive), LIMITS.skill);
+      D().skill = clamp(D().skill * Math.exp(SKILL_RATE * meanDrive), limit('skill'));
       // Target tension, learned from how runs end.
       if (e.cause === 'quit' && endFelt > D().targetTension) D().targetTension -= 0.02;
       else if (duration > 1.3 * model.profile.runLength && meanFelt >= 0.9 * D().targetTension) {
@@ -198,6 +319,7 @@ export function createDirector({
     }
     recorder.saveSummary?.({
       at: Date.now(), duration, score: e.score, cause: e.cause, hits: run.hits,
+      clearedThreat: run.clearedThreat, clearedFar: run.clearedFar,
       meanFelt, skill: D().skill, targetTension: D().targetTension,
     });
     lastRunEnd = { at: Date.now(), endFelt, quitHandled: e.cause === 'quit' };
@@ -214,6 +336,13 @@ export function createDirector({
     get confidence() { return confidence; },
     get tension() { return tension; },
     get brake() { return brake; },
+    get struggling() { return struggling; },
+    get seetaPending() { return seetaPending; },
+    get shaktiStyle() { return style; },
+    get governor() { return governor(); },
+    get classicAt() { return classicAt; },
+    // This run's Shakti clears so far: { threat, far }.
+    get runClears() { return { threat: run?.clearedThreat ?? 0, far: run?.clearedFar ?? 0 }; },
     get felt() { return felt(); },
     get decisions() { return decisions; },
     get recorder() { return recorder; },
@@ -228,7 +357,10 @@ export function createDirector({
         arm = 'gate'; variant = ringVariant;
       } else if (personalising()) {
         const allowed = ctx.runTime > 12 ? ARMS : ARMS.filter((a) => a !== 'wall');
-        arm = chooseArm(model.bandit, D().targetRisk, allowed, rng);
+        // Relative target: the classic mix tilted to riskMul × its own expected hit rate.
+        const mix = classicArmWeights(ctx.runTime, d);
+        const classicHitRate = allowed.reduce((s, a) => s + mix[a] * banditMean(model.bandit[a]), 0);
+        arm = chooseArm(model.bandit, mix, classicHitRate * knob('riskMul'), allowed, rng);
       } else {
         // Today's spawnWave() selection, unchanged.
         const r = rng();
@@ -238,7 +370,7 @@ export function createDirector({
         else arm = 'gate';
       }
       waves.set(id, { arm, pending: 0, hit: false, nearMiss: false, cleared: false });
-      return { id, arm, variant, d };
+      return { id, arm, variant, d, offered: !!ringVariant };
     },
 
     // ctx: { waveId, x, y, z, s, sy, xRange, yRange, count, ship:{x,y,vx,vy}, speed, fixed }
@@ -250,72 +382,101 @@ export function createDirector({
       let { x, y } = ctx;
       let features = featuresFor(x, y, ctx, pred);
       let risk = predictRisk(model.risk, features);
-      let personal = false;
-      if (!ctx.fixed && ctx.xRange && personalising()) {
+      const classicRisk = risk;
+      let personal = false, goal = classicRisk;
+      if (!ctx.fixed && ctx.xRange && personalisingPlacement()) {
         personal = true;
-        // targetRisk is per wave; split it across the wave's obstacles.
-        const perObstacle = 1 - Math.pow(1 - D().targetRisk, 1 / Math.max(1, ctx.count ?? 1));
-        const goal = perObstacle + (rng() - 0.5) * 0.06 * perObstacle / D().targetRisk;
-        let bestGap = Infinity;
+        // Aim at the classic proposal's risk scaled by riskMul (±5% jitter). The classic spot
+        // is the fallback, and no candidate below the floor is ever taken.
+        goal = classicRisk * knob('riskMul') * (1 + (rng() - 0.5) * 0.1);
+        const floor = LIMITS.riskMul[0] * classicRisk;
+        let bestGap = Math.abs(classicRisk - goal);
+        // Half the candidates slide the classic spot along the line from the predicted ship
+        // (risk falls with distance, so this reaches the goal precisely); half are random.
+        const radial = CANDIDATES / 2;
         for (let i = 0; i < CANDIDATES; i++) {
-          const cx = lerp(ctx.xRange[0], ctx.xRange[1], rng());
-          const cy = lerp(ctx.yRange[0], ctx.yRange[1], rng());
+          const k = 0.4 * Math.pow(4, i / (radial - 1)); // 0.4× … 1.6× the classic distance
+          const cx = i < radial ? clamp(pred.x + (ctx.x - pred.x) * k, ctx.xRange) : lerp(ctx.xRange[0], ctx.xRange[1], rng());
+          const cy = i < radial ? clamp(pred.y + (ctx.y - pred.y) * k, ctx.yRange) : lerp(ctx.yRange[0], ctx.yRange[1], rng());
           const f = featuresFor(cx, cy, ctx, pred);
           const r = predictRisk(model.risk, f);
-          if (Math.abs(r - goal) < bestGap) {
+          if (r >= floor && Math.abs(r - goal) < bestGap) {
             bestGap = Math.abs(r - goal);
             x = cx; y = cy; features = f; risk = r;
           }
         }
       }
-      if (!ctx.fixed) logDecision({ kind: 'obstacle', x, y, risk, target: D().targetRisk, personal });
-      return { x, y, z: ctx.z, s: ctx.s, sy: ctx.sy, features, risk, side: Math.sign(x - pred.x) };
+      if (!ctx.fixed) logDecision({ kind: 'obstacle', x, y, risk, target: goal, personal });
+      return { x, y, z: ctx.z, s: ctx.s, sy: ctx.sy, features, risk, classicRisk, side: Math.sign(x - pred.x) };
     },
 
     // Choose wall gap column(s). ctx: { cols, gaps (classic), ship, speed, z }
+    // The classic gap stays unless the controller is pushing harder (riskMul > 1); then the
+    // gap whose miss risk is nearest classicRisk × riskMul (never below the floor) is used.
     wallGaps(ctx) {
-      if (!personalising()) return ctx.gaps;
+      if (!personalisingPlacement()) return ctx.gaps;
       const pred = predictShip(model.profile, ctx.ship, arrival(ctx));
       const warning = Math.min(arrival(ctx), VISIBLE_Z / Math.max(ctx.speed, 1));
-      const options = [];
-      ctx.cols.forEach((_, i) => {
-        options.push([i]);
-        if (i < ctx.cols.length - 1) options.push([i, i + 1]);
-      });
-      const goal = D().targetRisk + (rng() - 0.5) * 0.06;
-      let best = ctx.gaps, bestGap = Infinity, bestRisk = 0;
-      for (const gaps of options) {
+      const riskOf = (gaps) => {
         const gx = gaps.reduce((s, i) => s + ctx.cols[i], 0) / gaps.length;
-        const halfWidth = gaps.length === 1 ? 1.1 : 3.1;
-        const risk = missProbability(model.profile, Math.abs(gx - pred.x), warning, halfWidth);
-        if (Math.abs(risk - goal) < bestGap) { bestGap = Math.abs(risk - goal); best = new Set(gaps); bestRisk = risk; }
+        return missProbability(model.profile, Math.abs(gx - pred.x), warning, gaps.length === 1 ? 1.1 : 3.1);
+      };
+      const classicRisk = riskOf([...ctx.gaps]);
+      let best = ctx.gaps, bestRisk = classicRisk, goal = classicRisk;
+      if (knob('riskMul') > 1) {
+        goal = classicRisk * knob('riskMul');
+        const floor = LIMITS.riskMul[0] * classicRisk;
+        let bestGap = Math.abs(classicRisk - goal);
+        ctx.cols.forEach((_, i) => {
+          for (const gaps of i < ctx.cols.length - 1 ? [[i], [i, i + 1]] : [[i]]) {
+            const risk = riskOf(gaps);
+            if (risk >= floor && Math.abs(risk - goal) < bestGap) { bestGap = Math.abs(risk - goal); best = new Set(gaps); bestRisk = risk; }
+          }
+        });
       }
-      logDecision({ kind: 'wall', x: [...best].join('+'), y: '', risk: bestRisk, target: D().targetRisk, personal: true });
+      logDecision({ kind: 'wall', x: [...best].join('+'), y: '', risk: bestRisk, target: goal, personal: best !== ctx.gaps });
       return best;
     },
 
-    // Returns 'ram' / 'seeta' when the player needs that ring now, else null.
+    // Returns the variant of a director-offered ring, else null. The game marks the wave
+    // `offered`: such rings never score; 'ram' only restores shield, 'seeta' only a charge.
+    // - 'ram' (rescue कवच): players flagged as struggling, shield low, ≤ 1 per RESCUE.interval s.
+    // - 'seeta' (refill): 0 charges, none already in flight, ≥ SEETA.cooldown s since the last.
     shouldOfferRing(ctx) {
-      if (confidence <= 0) return null;
-      if (ctx.shield <= 40 && rng() < 0.35 * confidence) return 'ram';
-      if (ctx.powerCharges === 0 && ctx.obstacles >= 6 && rng() < 0.3 * confidence) return 'seeta';
+      if (confidence <= 0 || governor() > 0) return null; // no gifts while chasing a best
+      if (struggling && ctx.shield <= RESCUE.shield && ctx.runTime - lastRescueAt >= RESCUE.interval) {
+        lastRescueAt = ctx.runTime;
+        return 'ram';
+      }
+      const cooldown = SEETA.cooldown * (style === 'convenience' ? SEETA.convenienceSlower : 1);
+      if (ctx.powerCharges === 0 && !seetaPending && ctx.runTime - lastSeetaAt >= cooldown) {
+        lastSeetaAt = ctx.runTime;
+        seetaPending = true;
+        return 'seeta';
+      }
       return null;
     },
 
     // ctx: { x, y, z (classic proposal), xRange, yRange, ship, speed }
+    // Every ring placed while personalising (the classic share too) is at least
+    // RING.minOffset from the ship's current position: a ship that doesn't move never flies
+    // through one. Cold start / Classic mode keep the original placement.
     placeRing(ctx, variant) {
-      if (!personalising()) return { x: ctx.x, y: ctx.y };
+      if (confidence <= 0) return { x: ctx.x, y: ctx.y };
+      if (!personalising()) return awayFromShip({ x: ctx.x, y: ctx.y }, ctx);
       const pred = predictShip(model.profile, ctx.ship, arrival(ctx));
-      const want = model.profile.reach * lerp(0.8, 0.9, rng());
+      const want = Math.max(RING.minOffset, model.profile.reach * lerp(0.8, 0.9, rng()));
       const start = rng() * Math.PI * 2;
       let best = { x: ctx.x, y: ctx.y }, bestGap = Infinity;
       for (let i = 0; i < 8; i++) {
         const a = start + (i / 8) * Math.PI * 2;
         const x = clamp(pred.x + Math.cos(a) * want, ctx.xRange);
         const y = clamp(pred.y + Math.sin(a) * want, ctx.yRange);
+        if (Math.hypot(x - ctx.ship.x, y - ctx.ship.y) < RING.minOffset) continue;
         const gap = Math.abs(Math.hypot(x - pred.x, y - pred.y) - want);
         if (gap < bestGap) { bestGap = gap; best = { x, y }; }
       }
+      best = awayFromShip(best, ctx);
       logDecision({ kind: `ring:${variant}`, x: best.x, y: best.y, risk: 0, target: want, personal: true });
       return best;
     },
@@ -323,7 +484,7 @@ export function createDirector({
     // Anchor for a fruit trail, nudged toward lanes the player under-uses.
     // ctx: { x, y (classic proposal), xRange, yRange }
     fruitPath(ctx) {
-      if (!personalising()) return { x: ctx.x, y: ctx.y };
+      if (!personalisingPlacement()) return { x: ctx.x, y: ctx.y };
       const heat = model.profile.heat;
       const max = Math.max(...heat);
       const weights = heat.map((h) => max - h + 0.02);
@@ -336,8 +497,8 @@ export function createDirector({
       };
     },
 
-    speedMultiplier() { return lerp(CLASSIC.speedMul, D().speedMul, confidence); },
-    spawnGapMultiplier() { return lerp(CLASSIC.gapMul, D().gapMul, confidence); },
+    speedMultiplier() { return lerp(CLASSIC.speedMul, knob('speedMul'), confidence); },
+    spawnGapMultiplier() { return lerp(CLASSIC.gapMul, knob('gapMul'), confidence); },
     personalRamp(runTime) {
       const skill = lerp(CLASSIC.skill, D().skill, confidence);
       return Math.min(1, runTime * skill / CLASSIC.rampSeconds);
@@ -371,9 +532,14 @@ export function createDirector({
     tick(dt, ctx) {
       if (!ctx.playing) return;
       clock += dt;
+      if (ctx.score !== undefined) runScore = ctx.score;
+      if (classicAt !== null && confidence > 0 && runScore >= classicAt) {
+        // Rule 1: from here on this game plays like Classic (storms and orbs stay personalised).
+        confidence = 0;
+        for (const key of Object.keys(govBoost)) govBoost[key] = 0;
+      }
       tension *= Math.exp(-TENSION.decay * dt);
-      brake *= Math.exp(-BRAKE.decay * dt);
-      if (brake < BRAKE.release) brake = 0;
+      brake = Math.max(0, brake - dt);
       // Hold the controller until obstacles actually reach the player this run: the empty
       // opening seconds would otherwise read as "too calm" every run and wind difficulty up.
       if (confidence > 0 && run?.engaged) stepController(dt);
@@ -404,11 +570,37 @@ export function createDirector({
       if (e.t === undefined) e.t = clock;
       if (e.type === 'run_start') {
         confidence = computeConfidence();
+        placementConfidence = confidence;
+        // Rule 2: one personalised game per block of `personalBlock`, at a random slot drawn
+        // when each block starts. Only games that could be personalised are counted.
+        if (confidence > 0 && personalBlock > 1) {
+          const p = model.profile;
+          if (p.blockGame === 0 || p.blockSlot >= personalBlock) p.blockSlot = Math.floor(rng() * personalBlock);
+          const personal = p.blockGame === p.blockSlot;
+          p.blockGame = (p.blockGame + 1) % personalBlock;
+          if (!personal) confidence = 0;
+        }
+        // Rule 1: switch this game to Classic at a score drawn within ± the window of the best
+        // score the game passes in (`e.best`); none without a best.
+        classicAt = confidence > 0 && e.best > 0
+          ? Math.max(0, e.best + (rng() * 2 - 1) * CLASSIC_SWITCH_WINDOW) : null;
+        struggling = confidence > 0 && isStruggling(model.profile);
+        style = confidence > 0 ? shaktiStyle(model.profile) : 'unknown';
+        lastRescueAt = 0;
+        lastSeetaAt = 0;
+        runScore = 0;
+        for (const key of Object.keys(govBoost)) govBoost[key] = 0;
+        seetaPending = false;
+        // A player no longer struggling loses any below-Classic easing learned meanwhile.
+        if (learning()) for (const key of ['speedMul', 'gapMul', 'skill', 'riskMul']) D()[key] = clamp(D()[key], limit(key));
         // Tension and the brake carry over between runs (they only decay during play), so
         // the strain of a death still counts when the player restarts straight away.
         clock = 0; e.t = 0; sampleTimer = 0;
         waves.clear();
-        run = { engagedTime: 0, feltSum: 0, driveSum: 0, recent: [], recentTimer: 0, hits: 0, engaged: false };
+        run = {
+          engagedTime: 0, feltSum: 0, driveSum: 0, recent: [], recentTimer: 0, hits: 0, engaged: false,
+          clearedThreat: 0, clearedFar: 0,
+        };
       }
       if (!learning()) {
         if (e.type === 'run_end') run = null;
@@ -433,7 +625,7 @@ export function createDirector({
         const hit = e.outcome === 'hit';
         if (e.outcome === 'nearMiss') addTension(TENSION.nearMiss);
         if (run) { run.engaged = true; if (hit) run.hits++; }
-        if (hit) applyBrake(); // after counting, so the last-life hit brakes hardest
+        if (hit) applyBrake();
         if (e.features && e.outcome !== 'ignored') updateRisk(model.risk, e.features, hit ? 1 : 0);
         const wave = waves.get(e.waveId);
         if (wave) {
@@ -449,6 +641,16 @@ export function createDirector({
           wave.cleared = true;
           if (--wave.pending <= 0) resolveWave(id, wave);
         }
+        // One outcome per storm still ahead (see classifyShaktiClear). Recorded as their own
+        // events; they never label the risk model (the storm's fate is unknown).
+        for (const outcome of e.clears ?? []) director.onEvent({ type: 'obstacle_clear', outcome });
+      } else if (e.type === 'obstacle_clear') {
+        // Clearing an imminent hit is as tense as a near miss.
+        const threat = e.outcome === 'cleared_threat';
+        if (threat) addTension(TENSION.nearMiss);
+        if (run) { run.engaged = true; if (threat) run.clearedThreat++; else run.clearedFar++; }
+      } else if (e.type === 'gate') {
+        if (e.offered && e.variant === 'seeta') seetaPending = false;
       }
     },
 
@@ -464,14 +666,17 @@ export function createDirector({
       tracker = createProfileTracker(model.profile);
       fresh = true;
       confidence = 0;
+      placementConfidence = 0;
       tension = 0;
       brake = 0;
+      runScore = 0;
+      for (const key of Object.keys(govBoost)) govBoost[key] = 0;
       waves.clear();
       decisions.length = 0;
     },
     setClassic(on) {
       model.classic = !!on;
-      if (on) confidence = 0;
+      if (on) { confidence = 0; placementConfidence = 0; }
       storage.save(model);
     },
   };
