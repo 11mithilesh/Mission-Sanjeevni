@@ -9,6 +9,10 @@
 export const HEAT_COLS = 5;
 export const HEAT_ROWS = 3;
 export const BOUNDS = { x: 9, yMin: 0.9, yMax: 7.2 }; // mirrors main.js
+export const RUN_HISTORY = 15;
+// Struggling: each of the last STRUGGLE.recent runs is shorter than STRUGGLE.share × the
+// median of the recorded runs (needs at least STRUGGLE.minRuns of history).
+export const STRUGGLE = { recent: 3, share: 0.6, minRuns: 6 };
 
 export function defaultProfile() {
   return {
@@ -20,6 +24,9 @@ export function defaultProfile() {
     reach: 6,                // typical distance travelled in ~1 s when moving
     recentHitRate: 0.15,     // per-obstacle hit rate
     runLength: 60,           // typical run duration (s)
+    // Last RUN_HISTORY run durations (s), newest first; 0 = no run yet. Fixed length so
+    // storage's type check keeps it.
+    recentRuns: new Array(RUN_HISTORY).fill(0),
     boost: 0.1,              // fraction of time spent boosting
     shaktiThreat: 3,         // obstacles on screen when Shakti is used
     shaktiPerMin: 0.5,
@@ -49,6 +56,15 @@ export function heatCellCenter(index) {
 // +1 → obstacles to the player's right are harder to dodge, −1 → left.
 export const weakSide = (p) => Math.tanh(4 * (p.hitRight - p.hitLeft));
 
+export function isStruggling(p) {
+  const runs = p.recentRuns.filter((d) => d > 0);
+  if (runs.length < STRUGGLE.minRuns) return false;
+  const sorted = [...runs].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  return runs.slice(0, STRUGGLE.recent).every((d) => d < STRUGGLE.share * median);
+}
+
 // Occupancy-weighted mean position: where the player tends to sit.
 export function preferredPosition(p) {
   let x = 0, y = 0, total = 0;
@@ -76,6 +92,8 @@ export function createProfileTracker(profile) {
         case 'run_end':
           p.runs++;
           p.runLength = ewma(p.runLength, e.duration, p.runs === 1 ? 0.5 : 0.2);
+          p.recentRuns.pop();
+          p.recentRuns.unshift(Math.max(e.duration, 0.001));
           p.shaktiPerMin = ewma(p.shaktiPerMin, runShakti / Math.max(e.duration / 60, 0.25), 0.2);
           break;
         case 'wave_spawn':

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createDirector, defaultModel, LIMITS, CLASSIC } from '../personalization/director.js';
 import { createStorage } from '../personalization/storage.js';
 import { createRecorder } from '../personalization/recorder.js';
+import { isStruggling, createProfileTracker } from '../personalization/profile.js';
 import { seeded, memoryBackend } from './helpers.mjs';
 
 const ship = { x: 0, y: 4, vx: 0, vy: 0 };
@@ -218,6 +219,47 @@ test('about 10% of decisions stay classic at full confidence', () => {
     if (p.x === 3.3 && p.y === 2.2) classic++;
   }
   assert.ok(Math.abs(classic / N - 0.1) < 0.02, `classic share ${classic / N}`);
+});
+
+test('struggling: each of the last 3 runs under 0.6 × the median run length', () => {
+  const profile = defaultModel().profile;
+  const withRuns = (runs) => ({ ...profile, recentRuns: [...runs, ...new Array(15 - runs.length).fill(0)] });
+  assert.equal(isStruggling(withRuns([10, 10, 10, 60, 60])), false, 'too little history');
+  assert.equal(isStruggling(withRuns([10, 12, 20, 60, 60, 60, 60])), true);
+  assert.equal(isStruggling(withRuns([10, 40, 20, 60, 60, 60, 60])), false, 'one recent run was fine');
+  assert.equal(isStruggling(withRuns(new Array(15).fill(30))), false);
+
+  const tracker = createProfileTracker(defaultModel().profile);
+  for (const d of [50, 40, 30]) tracker.update({ type: 'run_end', duration: d });
+  assert.deepEqual(tracker.profile.recentRuns.slice(0, 4), [30, 40, 50, 0], 'newest first, fixed length');
+  assert.equal(tracker.profile.recentRuns.length, 15);
+});
+
+function strugglingDirector(recentRuns) {
+  const trained = defaultModel();
+  trained.profile.observations = 10000;
+  trained.profile.recentRuns = [...recentRuns, ...new Array(15 - recentRuns.length).fill(0)];
+  const director = makeDirector({ model: trained });
+  director.onEvent({ type: 'run_start' });
+  return director;
+}
+
+test('rescue gates: only for struggling players, low shield, one per 30 s of run time', () => {
+  const offers = (director, runTime, shield = 30) =>
+    director.chooseWave({ runTime, shield, powerCharges: 0, obstacles: 12 });
+
+  const fine = strugglingDirector([60, 60, 60, 60, 60, 60, 60]);
+  assert.equal(fine.struggling, false);
+  for (let t = 0; t < 300; t += 5) assert.equal(offers(fine, t).rescue, false);
+
+  const weak = strugglingDirector([10, 12, 20, 60, 60, 60, 60]);
+  assert.equal(weak.struggling, true);
+  assert.equal(offers(weak, 20).rescue, false, 'none in the first 30 s');
+  assert.equal(offers(weak, 35, 80).rescue, false, 'shield not low');
+  const first = offers(weak, 35);
+  assert.deepEqual([first.rescue, first.arm, first.variant], [true, 'gate', 'ram']);
+  assert.equal(offers(weak, 50).rescue, false, 'cooldown');
+  assert.equal(offers(weak, 66).rescue, true);
 });
 
 test('reset forgets everything but keeps the classic preference', () => {

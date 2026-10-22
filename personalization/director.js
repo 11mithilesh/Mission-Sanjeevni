@@ -27,7 +27,7 @@
 import { createStorage, SCHEMA_VERSION } from './storage.js';
 import { createRecorder } from './recorder.js';
 import {
-  defaultProfile, createProfileTracker, weakSide, heatCellCenter, BOUNDS,
+  defaultProfile, createProfileTracker, weakSide, heatCellCenter, isStruggling, BOUNDS,
 } from './profile.js';
 import { defaultRisk, riskFeatures, predictRisk, updateRisk } from './models/risk.js';
 import { ARMS, defaultBandit, updateBandit, chooseArm, banditMean } from './models/bandit.js';
@@ -61,6 +61,7 @@ const TENSION = { nearMiss: 0.12, clean: -0.03, decay: 0.15 };
 // `riskKeep` is the share of riskMul's headroom above its floor kept on each hit.
 const BRAKE = { hit: 1, weight: 0.5, decay: 0.15, release: 0.15, riskKeep: 0.5 };
 const SKILL_RATE = 0.25; // log-skill change per run at a fully saturated controller push
+const RESCUE = { interval: 30, shield: 40 }; // s of run time per rescue gate; shield at or below
 
 const clamp = (v, [a, b]) => Math.min(b, Math.max(a, v));
 const lerp = (a, b, k) => a + (b - a) * k;
@@ -97,6 +98,8 @@ export function createDirector({
   let confidence = 0;
   let tension = 0;
   let brake = 0;
+  let struggling = false;  // frozen at run start from the profile's recent run lengths
+  let lastRescueAt = 0;    // run time of the last rescue gate (0: none before RESCUE.interval)
   let clock = 0;           // run time as seen by the director
   let sampleTimer = 0;
   let nextWaveId = 1;
@@ -226,6 +229,7 @@ export function createDirector({
     get confidence() { return confidence; },
     get tension() { return tension; },
     get brake() { return brake; },
+    get struggling() { return struggling; },
     get felt() { return felt(); },
     get decisions() { return decisions; },
     get recorder() { return recorder; },
@@ -253,7 +257,7 @@ export function createDirector({
         else arm = 'gate';
       }
       waves.set(id, { arm, pending: 0, hit: false, nearMiss: false, cleared: false });
-      return { id, arm, variant, d };
+      return { id, arm, variant, d, rescue: !!ringVariant };
     },
 
     // ctx: { waveId, x, y, z, s, sy, xRange, yRange, count, ship:{x,y,vx,vy}, speed, fixed }
@@ -317,12 +321,14 @@ export function createDirector({
       return best;
     },
 
-    // Returns 'ram' / 'seeta' when the player needs that ring now, else null.
+    // Returns 'ram' for a rescue कवच gate, else null. Only for players flagged as struggling,
+    // when the shield is low, and at most one per RESCUE.interval s of run time. A rescue
+    // gate restores shield but scores nothing (the game checks the wave's `rescue` flag).
     shouldOfferRing(ctx) {
-      if (confidence <= 0) return null;
-      if (ctx.shield <= 40 && rng() < 0.35 * confidence) return 'ram';
-      if (ctx.powerCharges === 0 && ctx.obstacles >= 6 && rng() < 0.3 * confidence) return 'seeta';
-      return null;
+      if (confidence <= 0 || !struggling || ctx.shield > RESCUE.shield) return null;
+      if (ctx.runTime - lastRescueAt < RESCUE.interval) return null;
+      lastRescueAt = ctx.runTime;
+      return 'ram';
     },
 
     // ctx: { x, y, z (classic proposal), xRange, yRange, ship, speed }
@@ -427,6 +433,8 @@ export function createDirector({
       if (e.t === undefined) e.t = clock;
       if (e.type === 'run_start') {
         confidence = computeConfidence();
+        struggling = confidence > 0 && isStruggling(model.profile);
+        lastRescueAt = 0;
         // Tension and the brake carry over between runs (they only decay during play), so
         // the strain of a death still counts when the player restarts straight away.
         clock = 0; e.t = 0; sampleTimer = 0;

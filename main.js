@@ -1186,6 +1186,7 @@ function spawn(type, x, y, z, variant = 'ram') {
   e.passed = false;
   e.crossD2 = undefined; // pooled entities: clear the previous life's crossing record
   e.crossInvuln = false;
+  e.rescue = false;      // rescue कवच gate offered by the director: shield only, no score
   e.waveId = null;    // which wave spawned it, for outcome attribution
   e.features = null;  // risk features at placement time (obstacles only)
   e.side = 0;
@@ -1304,7 +1305,7 @@ function waveGate(d, wave) {
   const { x, y } = director.placeRing({
     x: rand(-5.5, 5.5), y: rand(2.4, 5.6), z, xRange: [-5.5, 5.5], yRange: [2.4, 5.6], ship: shipCtx(), speed: state.speed,
   }, variant);
-  ring(x, y, z, variant);
+  ring(x, y, z, variant).rescue = wave.rescue;
   const { x: x0, y: y0 } = director.fruitPath({ x: rand(-7, 7), y: rand(1.8, 6.4), xRange: [-7, 7], yRange: [1.8, 6.4] });
   for (let i = 0; i < 4; i++) {
     const k = i / 4;
@@ -1509,10 +1510,17 @@ function onCollect(e) {
 }
 
 function onGate(e) {
-  state.combo += 2;
   const shieldBefore = state.shield;
   state.shield = Math.min(100, state.shield + 15);
   const kavachRepaired = state.shield > shieldBefore;
+  if (e.rescue) {
+    // Rescue gates only repair the shield: no points, no combo.
+    burst(e.mesh.position, 90, 10, [0.4, 2.0, 2.6], 0.9);
+    sfx.gate();
+    if (kavachRepaired) toast('KAVACH REPAIRED', '#ffd166');
+    return;
+  }
+  state.combo += 2;
   const pts = 100 * multiplier();
   state.score += pts;
   burst(e.mesh.position, 90, 10, [0.4, 2.0, 2.6], 0.9);
