@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyObstaclePass } from '../personalization/obstacles.js';
+import { classifyObstaclePass, classifyShaktiClear, SHAKTI_IMMINENT } from '../personalization/obstacles.js';
 
 // Frames of one storm (rx = 2, so the radius is behind the ship once zc >= 2.8).
 const approach = { zc: -5, rx: 2 };
@@ -43,4 +43,15 @@ test('invulnerability does not change a near miss or clean pass', () => {
 
 test('an already classified storm cannot be labelled again', () => {
   assert.equal(classifyObstaclePass({ passed: true, crossD2: 0.5 }, { ...behind(5), d2: 0.5, invuln: 0 }), null);
+});
+
+test('Shakti clears: imminent and overlapping is a threat, anything else is far', () => {
+  const ship = { x: 0, y: 4 };
+  const storm = { x: 0.5, y: 4.2, rx: 1.9, ry: 2 };
+  // 60 u/s: 30 units ahead arrives in 0.5 s.
+  assert.equal(classifyShaktiClear({ ...storm, z: -30 }, ship, 60), 'cleared_threat');
+  assert.equal(classifyShaktiClear({ ...storm, z: -90 }, ship, 60), 'cleared_far', 'arrives in 1.5 s');
+  assert.equal(classifyShaktiClear({ ...storm, x: 4, z: -30 }, ship, 60), 'cleared_far', 'off the ship line');
+  assert.equal(classifyShaktiClear({ ...storm, z: -60 }, ship, 60), 'cleared_threat', 'exactly SHAKTI_IMMINENT');
+  assert.equal(SHAKTI_IMMINENT, 1);
 });

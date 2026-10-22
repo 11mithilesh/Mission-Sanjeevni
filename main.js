@@ -7,7 +7,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createDirector } from './personalization/director.js';
 import { createDebugOverlay } from './personalization/debug-overlay.js';
 import { createBestScoreStore } from './personalization/best-score.js';
-import { classifyObstaclePass } from './personalization/obstacles.js';
+import { classifyObstaclePass, classifyShaktiClear } from './personalization/obstacles.js';
 
 /* =========================================================
    NEON DRIFT — a synthwave flyer in Three.js
@@ -1186,7 +1186,7 @@ function spawn(type, x, y, z, variant = 'ram') {
   e.passed = false;
   e.crossD2 = undefined; // pooled entities: clear the previous life's crossing record
   e.crossInvuln = false;
-  e.rescue = false;      // rescue कवच gate offered by the director: shield only, no score
+  e.offered = false;     // ring offered by the director: never scores (see onGate)
   e.waveId = null;    // which wave spawned it, for outcome attribution
   e.features = null;  // risk features at placement time (obstacles only)
   e.side = 0;
@@ -1241,14 +1241,20 @@ function clearObstacles() {
   }
   state.powerCharges--;
   const waveIds = [];
+  const clears = []; // per storm still ahead: was it an imminent threat?
+  const sp = ship.position;
   for (let i = entities.length - 1; i >= 0; i--) {
     const obstacle = entities[i];
     if (obstacle.type !== 'crystal') continue;
     if (!obstacle.passed && obstacle.waveId !== null) waveIds.push(obstacle.waveId);
+    if (!obstacle.passed) {
+      const p = obstacle.mesh.position;
+      clears.push(classifyShaktiClear({ x: p.x, y: p.y, z: p.z - sp.z, rx: obstacle.rx, ry: obstacle.ry }, sp, state.speed));
+    }
     burst(obstacle.mesh.position, 36, 12, [0.55, 1.5, 2.4], 0.8);
     removeAt(i);
   }
-  director.onEvent({ type: 'shakti_used', threats: cleared, waveIds });
+  director.onEvent({ type: 'shakti_used', threats: cleared, waveIds, clears });
   updatePowerBar();
   toast('OBSTACLES CLEARED', '#46f1ff');
 }
@@ -1305,7 +1311,7 @@ function waveGate(d, wave) {
   const { x, y } = director.placeRing({
     x: rand(-5.5, 5.5), y: rand(2.4, 5.6), z, xRange: [-5.5, 5.5], yRange: [2.4, 5.6], ship: shipCtx(), speed: state.speed,
   }, variant);
-  ring(x, y, z, variant).rescue = wave.rescue;
+  ring(x, y, z, variant).offered = wave.offered;
   const { x: x0, y: y0 } = director.fruitPath({ x: rand(-7, 7), y: rand(1.8, 6.4), xRange: [-7, 7], yRange: [1.8, 6.4] });
   for (let i = 0; i < 4; i++) {
     const k = i / 4;
@@ -1510,16 +1516,24 @@ function onCollect(e) {
 }
 
 function onGate(e) {
+  if (e.offered) {
+    // Director-offered rings never score or build combo: a कवच rescue only repairs the
+    // shield, a Seeta refill only restores a Shakti charge.
+    burst(e.mesh.position, 90, 10, [0.4, 2.0, 2.6], 0.9);
+    sfx.gate();
+    if (e.variant === 'ram' && state.shield < 100) {
+      state.shield = Math.min(100, state.shield + 15);
+      toast('KAVACH REPAIRED', '#ffd166');
+    } else if (e.variant === 'seeta' && state.powerCharges < 3) {
+      state.powerCharges++;
+      updatePowerBar();
+      toast('SHAKTI REFILLED', '#ff263f');
+    }
+    return;
+  }
   const shieldBefore = state.shield;
   state.shield = Math.min(100, state.shield + 15);
   const kavachRepaired = state.shield > shieldBefore;
-  if (e.rescue) {
-    // Rescue gates only repair the shield: no points, no combo.
-    burst(e.mesh.position, 90, 10, [0.4, 2.0, 2.6], 0.9);
-    sfx.gate();
-    if (kavachRepaired) toast('KAVACH REPAIRED', '#ffd166');
-    return;
-  }
   state.combo += 2;
   const pts = 100 * multiplier();
   state.score += pts;
@@ -1713,7 +1727,7 @@ function updateEntities(dt, dz, t) {
         e.passed = true;
         const dx = sp.x - m.position.x, dy = sp.y - m.position.y;
         const through = dx * dx + dy * dy < 2.1 * 2.1;
-        director.onEvent({ type: 'gate', passed: through, variant: e.variant });
+        director.onEvent({ type: 'gate', passed: through, variant: e.variant, offered: e.offered });
         if (through) onGate(e);
       }
     }

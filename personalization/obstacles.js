@@ -17,3 +17,16 @@ export function classifyObstaclePass(e, { zc, rx, d2, invuln }) {
   if (e.crossD2 < 1) return e.crossInvuln ? 'ignored' : null;
   return e.crossD2 < 2.25 ? 'nearMiss' : 'clean';
 }
+
+export const SHAKTI_IMMINENT = 1.0; // s: a cleared storm arriving sooner than this was imminent
+
+// A storm still ahead of the ship, cleared by Shakti. 'cleared_threat' when it would have
+// arrived within SHAKTI_IMMINENT s and its collision ellipsoid overlaps the ship's current
+// position (laterally: same scaling as the hit test); otherwise 'cleared_far' (distant or
+// off-line: low threat). `z` is relative to the ship (negative = ahead).
+export function classifyShaktiClear({ x, y, z, rx, ry }, ship, speed) {
+  const tta = -z / Math.max(speed, 1);
+  const dx = (x - ship.x) / (rx + 1.0);
+  const dy = (y - ship.y) / (ry + 0.3);
+  return tta >= 0 && tta <= SHAKTI_IMMINENT && dx * dx + dy * dy < 1 ? 'cleared_threat' : 'cleared_far';
+}

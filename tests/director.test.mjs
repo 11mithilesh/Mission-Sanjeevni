@@ -276,20 +276,67 @@ function strugglingDirector(recentRuns) {
 
 test('rescue gates: only for struggling players, low shield, one per 30 s of run time', () => {
   const offers = (director, runTime, shield = 30) =>
-    director.chooseWave({ runTime, shield, powerCharges: 0, obstacles: 12 });
+    director.chooseWave({ runTime, shield, powerCharges: 3, obstacles: 12 }); // no Seeta refills
 
   const fine = strugglingDirector([60, 60, 60, 60, 60, 60, 60]);
   assert.equal(fine.struggling, false);
-  for (let t = 0; t < 300; t += 5) assert.equal(offers(fine, t).rescue, false);
+  for (let t = 0; t < 300; t += 5) assert.equal(offers(fine, t).offered, false);
 
   const weak = strugglingDirector([10, 12, 20, 60, 60, 60, 60]);
   assert.equal(weak.struggling, true);
-  assert.equal(offers(weak, 20).rescue, false, 'none in the first 30 s');
-  assert.equal(offers(weak, 35, 80).rescue, false, 'shield not low');
+  assert.equal(offers(weak, 20).offered, false, 'none in the first 30 s');
+  assert.equal(offers(weak, 35, 80).offered, false, 'shield not low');
   const first = offers(weak, 35);
-  assert.deepEqual([first.rescue, first.arm, first.variant], [true, 'gate', 'ram']);
-  assert.equal(offers(weak, 50).rescue, false, 'cooldown');
-  assert.equal(offers(weak, 66).rescue, true);
+  assert.deepEqual([first.offered, first.arm, first.variant], [true, 'gate', 'ram']);
+  assert.equal(offers(weak, 50).offered, false, 'cooldown');
+  assert.equal(offers(weak, 66).offered, true);
+});
+
+test('Seeta refills: only at 0 charges, one in flight, ≥ 30 s apart; never in Classic', () => {
+  const director = strugglingDirector([60, 60, 60, 60, 60, 60, 60]);
+  const wave = (runTime, powerCharges = 0) =>
+    director.chooseWave({ runTime, shield: 100, powerCharges, obstacles: 12 });
+  const seeta = (w) => w.offered && w.variant === 'seeta';
+
+  assert.equal(seeta(wave(10)), false, 'nothing in the first 30 s');
+  assert.equal(seeta(wave(31, 1)), false, 'charges left');
+  const first = wave(31);
+  assert.ok(seeta(first) && first.arm === 'gate');
+  assert.equal(director.seetaPending, true);
+  assert.equal(seeta(wave(70)), false, 'one already in flight');
+  director.onEvent({ type: 'gate', passed: false, variant: 'seeta', offered: true }); // missed it
+  assert.equal(director.seetaPending, false);
+  assert.equal(seeta(wave(60)), false, 'cooldown: 29 s since the last offer');
+  assert.ok(seeta(wave(61.5)));
+
+  // Over a long run with 0 charges every wave: at most 1 per 30 s.
+  const d2 = strugglingDirector([60, 60, 60, 60, 60, 60, 60]);
+  let offered = 0;
+  for (let t = 0; t <= 300; t += 1.5) {
+    const w = d2.chooseWave({ runTime: t, shield: 100, powerCharges: 0, obstacles: 12 });
+    if (seeta(w)) { offered++; d2.onEvent({ type: 'gate', passed: true, variant: 'seeta', offered: true }); }
+  }
+  assert.ok(offered <= 300 / 30, `offered ${offered}`);
+
+  const classic = makeDirector(); // cold start: confidence 0
+  classic.onEvent({ type: 'run_start' });
+  for (let t = 0; t < 300; t += 2) assert.equal(classic.chooseWave({ runTime: t, shield: 10, powerCharges: 0, obstacles: 12 }).offered, false);
+});
+
+test('Shakti clears: threats add near-miss tension and are counted; nothing labels the risk model', () => {
+  const trained = defaultModel();
+  trained.profile.observations = 10000;
+  const director = makeDirector({ model: trained });
+  director.onEvent({ type: 'run_start' });
+  const riskN = director.model.risk.n;
+  director.onEvent({ type: 'shakti_used', threats: 3, waveIds: [], clears: ['cleared_far', 'cleared_far'] });
+  assert.equal(director.tension, 0);
+  director.onEvent({ type: 'shakti_used', threats: 2, waveIds: [], clears: ['cleared_threat', 'cleared_far'] });
+  assert.ok(director.tension > 0);
+  assert.deepEqual(director.runClears, { threat: 1, far: 3 });
+  assert.equal(director.model.risk.n, riskN);
+  assert.equal(director.model.profile.shaktiClears, 4);
+  assert.equal(director.recorder.recent(10, 'obstacle_clear').length, 4);
 });
 
 test('reset forgets everything but keeps the classic preference', () => {

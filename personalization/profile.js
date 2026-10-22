@@ -18,6 +18,22 @@ export const STRUGGLE = { recent: 3, share: 0.6, minRuns: 6 };
 export const ACTIVE = { speed: 2, share: 0.2, alpha: 0.01 };
 export const engagement = (p) => Math.min(1, p.activity / ACTIVE.share);
 
+// How the player uses Shakti, from the storms it cleared:
+// 'panic'       mostly imminent threats (struggling: slight easing via tension, base refills);
+// 'convenience' mostly far/low-threat clears, used often or with many storms on screen
+//               (fewer refill offers, the controller pushes harder);
+// 'mixed' otherwise, 'unknown' until enough clears are seen.
+export const SHAKTI_STYLE = { minClears: 8, panicShare: 0.5, convenienceShare: 0.25, usesPerMin: 0.5, threat: 4 };
+export function shaktiStyle(p) {
+  const s = SHAKTI_STYLE;
+  if (p.shaktiClears < s.minClears) return 'unknown';
+  if (p.clearThreatShare >= s.panicShare) return 'panic';
+  if (p.clearThreatShare < s.convenienceShare && (p.shaktiPerMin >= s.usesPerMin || p.shaktiThreat >= s.threat)) {
+    return 'convenience';
+  }
+  return 'mixed';
+}
+
 export function defaultProfile() {
   return {
     reaction: 0.35,          // s from a new wave to the start of a dodge
@@ -35,6 +51,8 @@ export function defaultProfile() {
     activity: ACTIVE.share,  // fraction of time the ship is moving (steering engagement)
     shaktiThreat: 3,         // obstacles on screen when Shakti is used
     shaktiPerMin: 0.5,
+    clearThreatShare: 0.5,   // share of Shakti-cleared storms that were imminent threats
+    shaktiClears: 0,         // Shakti-cleared storms seen (gates shaktiStyle)
     themes: {},              // storm theme -> hit rate
     observations: 0,         // obstacle outcomes seen (drives personalisation fade-in)
     runs: 0,
@@ -117,6 +135,10 @@ export function createProfileTracker(profile) {
         case 'shakti_used':
           runShakti++;
           p.shaktiThreat = ewma(p.shaktiThreat, e.threats ?? 0, 0.2);
+          break;
+        case 'obstacle_clear':
+          p.shaktiClears++;
+          p.clearThreatShare = ewma(p.clearThreatShare, e.outcome === 'cleared_threat' ? 1 : 0, 0.1);
           break;
         case 'ship_sample': {
           const speed = Math.hypot(e.vx, e.vy);

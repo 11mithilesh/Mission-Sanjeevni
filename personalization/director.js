@@ -25,6 +25,9 @@
    Speed, spacing and ramp go easier than Classic only for
    players flagged as struggling (see profile.isStruggling),
    who are also the only ones offered rescue कवच gates.
+   Seeta refills are offered sparingly (see SEETA); storms a
+   player clears with Shakti are classified as imminent
+   threats (tension, like a near miss) or far clears.
    ========================================================= */
 
 import { createStorage, SCHEMA_VERSION } from './storage.js';
@@ -70,6 +73,9 @@ const BRAKE = { seconds: 8, weight: 0.5 };
 const PUSH_SHARE = 1 / 4;
 const SKILL_RATE = 0.25; // log-skill change per run at a fully saturated controller push
 const RESCUE = { interval: 30, shield: 40 }; // s of run time per rescue gate; shield at or below
+// Director-offered Seeta Shakti refills: only at 0 charges, one in flight at a time, and at
+// least `cooldown` s of run time between offers (so never more than 1 per 30 s).
+const SEETA = { cooldown: 30 };
 
 const clamp = (v, [a, b]) => Math.min(b, Math.max(a, v));
 const lerp = (a, b, k) => a + (b - a) * k;
@@ -108,6 +114,8 @@ export function createDirector({
   let brake = 0;
   let struggling = false;  // frozen at run start from the profile's recent run lengths
   let lastRescueAt = 0;    // run time of the last rescue gate (0: none before RESCUE.interval)
+  let lastSeetaAt = 0;     // run time of the last offered Seeta ring (0: none before the cooldown)
+  let seetaPending = false; // an offered Seeta ring is still in flight
   let clock = 0;           // run time as seen by the director
   let sampleTimer = 0;
   let nextWaveId = 1;
@@ -235,6 +243,7 @@ export function createDirector({
     }
     recorder.saveSummary?.({
       at: Date.now(), duration, score: e.score, cause: e.cause, hits: run.hits,
+      clearedThreat: run.clearedThreat, clearedFar: run.clearedFar,
       meanFelt, skill: D().skill, targetTension: D().targetTension,
     });
     lastRunEnd = { at: Date.now(), endFelt, quitHandled: e.cause === 'quit' };
@@ -252,6 +261,9 @@ export function createDirector({
     get tension() { return tension; },
     get brake() { return brake; },
     get struggling() { return struggling; },
+    get seetaPending() { return seetaPending; },
+    // This run's Shakti clears so far: { threat, far }.
+    get runClears() { return { threat: run?.clearedThreat ?? 0, far: run?.clearedFar ?? 0 }; },
     get felt() { return felt(); },
     get decisions() { return decisions; },
     get recorder() { return recorder; },
@@ -279,7 +291,7 @@ export function createDirector({
         else arm = 'gate';
       }
       waves.set(id, { arm, pending: 0, hit: false, nearMiss: false, cleared: false });
-      return { id, arm, variant, d, rescue: !!ringVariant };
+      return { id, arm, variant, d, offered: !!ringVariant };
     },
 
     // ctx: { waveId, x, y, z, s, sy, xRange, yRange, count, ship:{x,y,vx,vy}, speed, fixed }
@@ -347,14 +359,22 @@ export function createDirector({
       return best;
     },
 
-    // Returns 'ram' for a rescue कवच gate, else null. Only for players flagged as struggling,
-    // when the shield is low, and at most one per RESCUE.interval s of run time. A rescue
-    // gate restores shield but scores nothing (the game checks the wave's `rescue` flag).
+    // Returns the variant of a director-offered ring, else null. The game marks the wave
+    // `offered`: such rings never score; 'ram' only restores shield, 'seeta' only a charge.
+    // - 'ram' (rescue कवच): players flagged as struggling, shield low, ≤ 1 per RESCUE.interval s.
+    // - 'seeta' (refill): 0 charges, none already in flight, ≥ SEETA.cooldown s since the last.
     shouldOfferRing(ctx) {
-      if (confidence <= 0 || !struggling || ctx.shield > RESCUE.shield) return null;
-      if (ctx.runTime - lastRescueAt < RESCUE.interval) return null;
-      lastRescueAt = ctx.runTime;
-      return 'ram';
+      if (confidence <= 0) return null;
+      if (struggling && ctx.shield <= RESCUE.shield && ctx.runTime - lastRescueAt >= RESCUE.interval) {
+        lastRescueAt = ctx.runTime;
+        return 'ram';
+      }
+      if (ctx.powerCharges === 0 && !seetaPending && ctx.runTime - lastSeetaAt >= SEETA.cooldown) {
+        lastSeetaAt = ctx.runTime;
+        seetaPending = true;
+        return 'seeta';
+      }
+      return null;
     },
 
     // ctx: { x, y, z (classic proposal), xRange, yRange, ship, speed }
@@ -460,13 +480,18 @@ export function createDirector({
         confidence = computeConfidence();
         struggling = confidence > 0 && isStruggling(model.profile);
         lastRescueAt = 0;
+        lastSeetaAt = 0;
+        seetaPending = false;
         // A player no longer struggling loses any below-Classic easing learned meanwhile.
         if (learning()) for (const key of ['speedMul', 'gapMul', 'skill', 'riskMul']) D()[key] = clamp(D()[key], limit(key));
         // Tension and the brake carry over between runs (they only decay during play), so
         // the strain of a death still counts when the player restarts straight away.
         clock = 0; e.t = 0; sampleTimer = 0;
         waves.clear();
-        run = { engagedTime: 0, feltSum: 0, driveSum: 0, recent: [], recentTimer: 0, hits: 0, engaged: false };
+        run = {
+          engagedTime: 0, feltSum: 0, driveSum: 0, recent: [], recentTimer: 0, hits: 0, engaged: false,
+          clearedThreat: 0, clearedFar: 0,
+        };
       }
       if (!learning()) {
         if (e.type === 'run_end') run = null;
@@ -507,6 +532,16 @@ export function createDirector({
           wave.cleared = true;
           if (--wave.pending <= 0) resolveWave(id, wave);
         }
+        // One outcome per storm still ahead (see classifyShaktiClear). Recorded as their own
+        // events; they never label the risk model (the storm's fate is unknown).
+        for (const outcome of e.clears ?? []) director.onEvent({ type: 'obstacle_clear', outcome });
+      } else if (e.type === 'obstacle_clear') {
+        // Clearing an imminent hit is as tense as a near miss.
+        const threat = e.outcome === 'cleared_threat';
+        if (threat) addTension(TENSION.nearMiss);
+        if (run) { run.engaged = true; if (threat) run.clearedThreat++; else run.clearedFar++; }
+      } else if (e.type === 'gate') {
+        if (e.offered && e.variant === 'seeta') seetaPending = false;
       }
     },
 
