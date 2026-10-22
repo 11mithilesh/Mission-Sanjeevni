@@ -3,6 +3,47 @@ import assert from 'node:assert/strict';
 import { createStorage, migrate, STORAGE_KEY, MAX_BYTES } from '../personalization/storage.js';
 import { defaultModel } from '../personalization/director.js';
 import { memoryBackend, throwingBackend } from './helpers.mjs';
+import {
+  BEST_SCORE_KEYS, SHARED_BEST_SCORE_KEY, LEGACY_BEST_SCORE_KEY, createBestScoreStore,
+} from '../personalization/best-score.js';
+
+test('adaptive and classic keep separate best scores', () => {
+  const backend = memoryBackend();
+  const store = createBestScoreStore({ backend });
+  assert.equal(store.get('adaptive'), 0);
+  assert.equal(store.get('classic'), 0);
+  store.set('classic', 900);
+  assert.equal(store.get('classic'), 900);
+  assert.equal(store.get('adaptive'), 0);
+  store.set('adaptive', 50);
+  assert.equal(createBestScoreStore({ backend }).get('adaptive'), 50);
+  assert.equal(createBestScoreStore({ backend }).get('classic'), 900);
+});
+
+test('an old shared best seeds both modes once, preferring the newest old key', () => {
+  for (const [key, value] of [[LEGACY_BEST_SCORE_KEY, '1234'], [SHARED_BEST_SCORE_KEY, '20']]) {
+    const backend = memoryBackend();
+    backend.setItem(key, value);
+    if (key === SHARED_BEST_SCORE_KEY) backend.setItem(LEGACY_BEST_SCORE_KEY, '30');
+    const store = createBestScoreStore({ backend });
+    assert.equal(store.get('adaptive'), Number(value));
+    assert.equal(store.get('classic'), Number(value));
+    assert.equal(backend.getItem(BEST_SCORE_KEYS.classic), value);
+    assert.equal(backend.getItem(SHARED_BEST_SCORE_KEY), null);
+    assert.equal(backend.getItem(LEGACY_BEST_SCORE_KEY), null);
+  }
+});
+
+test('migration never overwrites a per-mode best; unavailable storage is tolerated', () => {
+  const backend = memoryBackend();
+  backend.setItem(BEST_SCORE_KEYS.classic, '700');
+  backend.setItem(SHARED_BEST_SCORE_KEY, '300');
+  const store = createBestScoreStore({ backend });
+  assert.equal(store.get('classic'), 700);
+  assert.equal(store.get('adaptive'), 300);
+  assert.doesNotThrow(() => createBestScoreStore({ backend: throwingBackend }).get('adaptive'));
+  assert.doesNotThrow(() => createBestScoreStore({ backend: throwingBackend }).set('classic', 10));
+});
 
 test('round-trip: saved model loads back identically', () => {
   const backend = memoryBackend();
@@ -32,7 +73,7 @@ test('missing or corrupted fields are filled from defaults', () => {
   backend.setItem(STORAGE_KEY, JSON.stringify({ version: 1, director: { targetTension: 'oops' }, risk: { w: [1, 2] } }));
   const { model, fresh } = createStorage({ defaults: defaultModel, backend }).load();
   assert.equal(fresh, false);
-  assert.equal(model.director.targetTension, 0.35);
+  assert.equal(model.director.targetTension, defaultModel().director.targetTension);
   assert.deepEqual(model.risk.w, defaultModel().risk.w);
   assert.equal(model.profile.heat.length, 15);
 });

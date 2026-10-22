@@ -116,6 +116,57 @@ test('tension controller outputs stay within their clamps', () => {
   }
 });
 
+test('hits brake instead of adding tension; near misses drive tension', () => {
+  const trained = defaultModel();
+  trained.profile.observations = 10000;
+  trained.director.targetRisk = 0.12;
+  const director = makeDirector({ model: trained });
+  director.onEvent({ type: 'run_start' });
+  director.onEvent({ type: 'obstacle_pass', outcome: 'nearMiss', features: [1, 0.1, 0.1, 0, 0.2, 1, 0, 0.1] });
+  const afterNearMiss = director.tension;
+  assert.ok(afterNearMiss > 0);
+  assert.equal(director.brake, 0);
+
+  director.onEvent({ type: 'obstacle_pass', outcome: 'hit', features: [1, 0.1, 0.1, 0, 0.2, 1, 0, 0.1] });
+  assert.equal(director.tension, afterNearMiss, 'a hit adds no tension');
+  assert.ok(director.brake > 0);
+  const [lo] = LIMITS.targetRisk;
+  assert.ok(Math.abs(director.model.director.targetRisk - (lo + (0.12 - lo) / 2)) < 1e-12, 'hit cuts the risk budget');
+
+  // While braked the controller only eases, even though near-miss tension is below target.
+  const before = { ...director.model.director };
+  for (let i = 0; i < 60; i++) director.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false });
+  assert.ok(director.model.director.speedMul < before.speedMul);
+  assert.ok(director.model.director.targetRisk < before.targetRisk);
+  assert.ok(director.model.director.gapMul > before.gapMul);
+
+  const firstBrake = director.brake;
+  director.onEvent({ type: 'obstacle_pass', outcome: 'hit', features: [1, 0.1, 0.1, 0, 0.2, 1, 0, 0.1] });
+  assert.ok(director.brake - firstBrake > 1.5, 'second hit of the run brakes harder');
+});
+
+test('saved models from older limits are clamped on load', () => {
+  const old = defaultModel();
+  old.director.targetRisk = 0.45;
+  const director = makeDirector({ model: old });
+  assert.equal(director.model.director.targetRisk, LIMITS.targetRisk[1]);
+});
+
+test('about 10% of decisions stay classic at full confidence', () => {
+  const trained = defaultModel();
+  trained.profile.observations = 10000;
+  const director = makeDirector({ model: trained, rng: seeded(9) });
+  director.onEvent({ type: 'run_start' });
+  assert.equal(director.confidence, 1);
+  let classic = 0;
+  const N = 4000;
+  for (let i = 0; i < N; i++) {
+    const p = director.placeObstacle({ waveId: 0, x: 3.3, y: 2.2, z: -240, s: 1, sy: 1.8, xRange: [-8.5, 8.5], yRange: [1.3, 6.8], count: 3, ship, speed: 60 });
+    if (p.x === 3.3 && p.y === 2.2) classic++;
+  }
+  assert.ok(Math.abs(classic / N - 0.1) < 0.02, `classic share ${classic / N}`);
+});
+
 test('reset forgets everything but keeps the classic preference', () => {
   const trained = defaultModel();
   trained.profile.observations = 999;

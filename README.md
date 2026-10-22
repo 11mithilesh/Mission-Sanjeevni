@@ -1,6 +1,6 @@
 # Mission Sanjeevni
 
-A Three.js flying game set beneath a sunset, with a stylized flying Hanuman crossing a river through changing forest regions and natural mountain ranges. Every 40–60 seconds (adapting to your typical run length as the game learns how you play), the river, stones, trees, and mountain colors shift together to suggest a new region, the storm-cloud obstacle model changes randomly, and the Devanagari place names from `places.json` appear in file order over distant mountains. Collect glowing fruit to build your multiplier, fly through gates to recharge your shield and Shakti power, and dodge storm clouds.
+A Three.js flying game set beneath a sunset, with a stylized flying Hanuman crossing a river through changing forest regions and natural mountain ranges. Every 40–60 seconds (adapting to your typical run length as the game learns how you play), the river, stones, trees, and mountain colors shift together to suggest a new region, the storm-cloud obstacle model changes randomly for newly spawned storms (existing storms keep their model), and the Devanagari place names from `places.json` appear in file order over distant mountains. Collect glowing fruit to build your multiplier, fly through gates to recharge your shield and Shakti power, and dodge storm clouds.
 
 No build step and no dependencies to install: it's a static site with local Hanuman and storm-cloud models, and Three.js loads from a CDN through an import map.
 
@@ -76,7 +76,7 @@ The game quietly adapts to how *you* fly. A small "director" watches your play a
 - A play profile: reaction time, which lanes you tend to fly in (a coarse 5×3 heatmap), which side you dodge worse, how much you over-correct your steering, how far you comfortably move in a second, your recent hit rate, typical run length, boost and Shakti habits, and how you fare against each storm theme. Each statistic slowly forgets old data, so the profile follows you as you improve.
 - A risk model (a tiny logistic regression) that estimates how likely a storm cloud placed at a given spot is to hit you.
 - Wave preferences: how often each wave type (wall, scatter, snake, gate) hits you.
-- A tension target and a ramp speed, nudged by how your runs end. For example, quitting right after a tense run lowers the target.
+- A tension target and a ramp speed, nudged by how your runs end. For example, quitting right after a tense run lowers the target. Tension comes from near misses, not hits: with only three hits per run, a hit instead acts as a brake that eases difficulty for a while. Even when fully personalised, about 10% of placements stay classic so the models keep seeing unbiased play.
 
 These drive the speed multiplier, the spacing between waves, how quickly difficulty ramps up, where storms, gates and fruit trails are placed, wall gap size, steering smoothness, and how long each region lasts. With no saved data, the game plays exactly like the original hand-tuned version. Personalisation fades in over your first few runs.
 
@@ -86,7 +86,7 @@ Only in your browser: one `localStorage` entry, `mission-sanjeevni-player-v1` (a
 
 **How to reset it**
 
-Click **Reset learning** on the start or game-over screen. You can also clear this site's data in your browser settings. Your best score is kept separately and is not reset.
+Click **Reset learning** on the start or game-over screen. You can also clear this site's data in your browser settings. Best scores are kept separately and are not reset. Adaptive and Classic mode each keep their own best, and the screens show the one for the selected mode.
 
 **Classic mode**
 
@@ -115,7 +115,7 @@ Handy knobs in `main.js`:
 - `UnrealBloomPass(..., strength, radius, threshold)`: glow intensity
 - `FOG_COLOR` and the sky/sun shaders: the color palette
 
-Personalisation knobs live at the top of `personalization/director.js`: `CLASSIC` (the original constants), `LIMITS` (clamps), `CONTROL` (controller gains and rate limits), `TENSION` (event weights) and `FADE_OBSERVATIONS` (how quickly personalisation fades in).
+Personalisation knobs live at the top of `personalization/director.js`: `CLASSIC` (the original constants), `LIMITS` (clamps), `CONTROL` (controller gains and rate limits), `TENSION` (near-miss tension weights), `BRAKE` (how hard a hit eases off), `CLASSIC_SHARE` (exploration) and `FADE_OBSERVATIONS` (how quickly personalisation fades in).
 
 ## License
 

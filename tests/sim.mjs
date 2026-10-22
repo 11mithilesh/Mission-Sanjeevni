@@ -2,12 +2,14 @@
    Headless simulation: bot players vs. the director.
    Mirrors main.js gameplay (speeds, spawn spacing, wave shapes,
    collision ellipsoids, shield/invulnerability, gates) without
-   Three.js. Run: node tests/sim.mjs  (exit code 1 on failure)
+   Three.js. Run: node tests/sim.mjs  (seeds 0–4; exit code 1 on any
+   failed check; SIM_SEED shifts the seeds, SIM_VERBOSE=1 prints runs)
    ========================================================= */
 
-import { createDirector, defaultModel } from '../personalization/director.js';
+import { createDirector, defaultModel, LIMITS } from '../personalization/director.js';
 import { createStorage } from '../personalization/storage.js';
 import { createRecorder } from '../personalization/recorder.js';
+import { classifyObstaclePass } from '../personalization/obstacles.js';
 import { seeded, memoryBackend } from './helpers.mjs';
 
 const BOUNDS = { x: 9, yMin: 0.9, yMax: 7.2 };
@@ -85,6 +87,21 @@ function createBot(skill, rng) {
   };
 }
 
+// ---------- Guardrails: every clamped value, checked every tick ----------
+const EPS = 1e-9;
+function guard(violations, name, value, [lo, hi]) {
+  if (!(value >= lo - EPS && value <= hi + EPS) && violations.length < 10) violations.push(`${name}=${value} outside [${lo}, ${hi}]`);
+}
+function checkGuardrails(director, t, violations) {
+  const d = director.model.director;
+  for (const key of ['speedMul', 'targetRisk', 'gapMul', 'targetTension', 'skill']) guard(violations, key, d[key], LIMITS[key]);
+  guard(violations, 'speedMultiplier()', director.speedMultiplier(), LIMITS.speedMul);
+  guard(violations, 'spawnGapMultiplier()', director.spawnGapMultiplier(), LIMITS.gapMul);
+  guard(violations, 'steeringFollow()', director.steeringFollow(), LIMITS.follow);
+  guard(violations, 'personalRamp()', director.personalRamp(t), [0, 1]);
+  guard(violations, 'tension', director.tension, [0, 1]);
+}
+
 // ---------- One run (mirrors main.js frame/updateEntities/wave*) ----------
 function playRun(director, bot, rng) {
   const rand = (a, b) => a + rng() * (b - a);
@@ -94,6 +111,9 @@ function playRun(director, bot, rng) {
   const st = { shield: 100, invuln: 1, runTime: 0, dist: 0, nextSpawn: 40, powerCharges: 3 };
   let gateCount = 0;
   const waveStats = new Map(); // wave id -> did any of its obstacles hit the player?
+  const waveTargets = new Map(); // wave id -> director targetRisk when the wave was placed
+  const calibration = [];        // [predicted risk at placement, hit?] per resolved obstacle
+  const violations = [];
   let nearMisses = 0;
   let hits = 0, passes = 0, riskSum = 0, riskTime = 0, waves = { wall: 0, scatter: 0, snake: 0, gate: 0 };
 
@@ -107,7 +127,7 @@ function playRun(director, bot, rng) {
     const p = director.placeObstacle({ waveId: wave.id, x, y, z, s, sy, xRange, yRange, count, fixed: !xRange, ship: shipCtx(), speed: world.speed });
     world.entities.push({
       type: 'crystal', x: p.x, y: p.y, z: p.z, rx: 1.9 * p.s, ry: 1.1 * p.s * p.sy,
-      passed: false, waveId: wave.id, features: p.features, side: p.side,
+      passed: false, waveId: wave.id, features: p.features, side: p.side, theme, risk: p.risk,
     });
   };
   const ring = (x, y, z, variant) => world.entities.push({ type: 'ring', x, y, z, variant, passed: false });
@@ -142,8 +162,9 @@ function playRun(director, bot, rng) {
   };
 
   const report = (e, outcome) => {
-    director.onEvent({ type: 'obstacle_pass', waveId: e.waveId, features: e.features, side: e.side, outcome, theme });
+    director.onEvent({ type: 'obstacle_pass', waveId: e.waveId, features: e.features, side: e.side, outcome, theme: e.theme });
     if (outcome !== 'ignored') { passes++; if (outcome === 'hit') hits++; if (outcome === 'nearMiss') nearMisses++; }
+    if (outcome !== 'ignored') calibration.push([e.risk, outcome === 'hit']);
     if (e.waveId !== null && outcome !== 'ignored') waveStats.set(e.waveId, (waveStats.get(e.waveId) || false) || outcome === 'hit');
   };
 
@@ -152,7 +173,9 @@ function playRun(director, bot, rng) {
     st.runTime += DT;
     if (st.runTime >= nextRegion) {
       theme = THEMES[director.pickStormTheme(THEMES)];
-      nextRegion = st.runTime + director.regionInterval();
+      const interval = director.regionInterval();
+      guard(violations, 'regionInterval', interval, LIMITS.region);
+      nextRegion = st.runTime + interval;
     }
     const d = director.personalRamp(st.runTime);
     const targetSpeed = (38 + d * 55) * director.speedMultiplier();
@@ -163,6 +186,7 @@ function playRun(director, bot, rng) {
       let obstacles = 0;
       for (const e of world.entities) if (e.type === 'crystal') obstacles++;
       const wave = director.chooseWave({ runTime: st.runTime, shield: st.shield, powerCharges: st.powerCharges, obstacles });
+      if (director.confidence > 0) waveTargets.set(wave.id, director.model.director.targetRisk);
       waves[wave.arm]++;
       W[wave.arm](wave.d, wave);
       director.onEvent({ type: 'wave_spawn', id: wave.id, arm: wave.arm });
@@ -191,14 +215,15 @@ function playRun(director, bot, rng) {
         const dzn = zc / (e.rx + 0.8);
         const d2 = dx * dx + dy * dy + dzn * dzn;
         if (st.invuln <= 0 && d2 < 1) {
-          report(e.passed ? { ...e, waveId: null } : e, 'hit');
+          report(e, 'hit');
           st.shield -= 34; st.invuln = 1.2;
           world.entities.splice(i, 1);
           continue;
         }
-        if (!e.passed && zOld < 0 && e.z >= 0) {
+        const outcome = classifyObstaclePass({ zc, rx: e.rx, d2, passed: e.passed });
+        if (outcome !== null) {
           e.passed = true;
-          report(e, d2 < 1 ? 'ignored' : d2 < 2.25 ? 'nearMiss' : 'clean');
+          report(e, outcome);
         }
       } else if (e.type === 'ring' && !e.passed && zOld < 0 && e.z >= 0) {
         e.passed = true;
@@ -214,6 +239,7 @@ function playRun(director, bot, rng) {
 
     director.tick(DT, { playing: true, ship: world.ship, target: world.target, boost: false });
     if (director.confidence > 0) { riskSum += director.model.director.targetRisk * DT; riskTime += DT; }
+    checkGuardrails(director, st.runTime, violations);
   }
 
   const duration = st.runTime;
@@ -221,9 +247,14 @@ function playRun(director, bot, rng) {
   director.onEvent({ type: 'run_end', duration, score: 0, cause });
   director.save();
   const m = director.model.director;
+  // Waves placed under personalisation that reached the player: realised hit vs. target at placement.
+  const targeted = [...waveStats].filter(([id]) => waveTargets.has(id));
   return {
-    duration, cause, hits, passes, nearMisses, waves,
+    duration, cause, hits, passes, nearMisses, waves, calibration, violations,
     waveHits: [...waveStats.values()].filter(Boolean).length, wavesFaced: waveStats.size,
+    targetedWaves: targeted.length,
+    targetedHits: targeted.filter(([, hit]) => hit).length,
+    targetedRiskSum: targeted.reduce((s, [id]) => s + waveTargets.get(id), 0),
     targetRisk: riskTime ? riskSum / riskTime : null,
     speedMul: director.speedMultiplier(), rawSpeedMul: m.speedMul, gapMul: m.gapMul,
     skill: m.skill, targetTension: m.targetTension, confidence: director.confidence,
@@ -233,12 +264,14 @@ function playRun(director, bot, rng) {
 // ---------- Experiment ----------
 // One bot plays RUNS runs. When it rage-quits, the session ends and the next run starts a
 // new session whose director reloads the saved model (exercises cross-session learning).
-function runBot(skill, seed) {
+// `classic` runs the same bot and seed with Classic mode on, as the baseline for check C.
+function runBot(skill, seed, { classic = false } = {}) {
   const rng = seeded(seed);
   const storage = createStorage({ defaults: defaultModel, backend: memoryBackend() });
   const newDirector = (s) => createDirector({ storage, rng: seeded(seed + 1000 + s), recorder: createRecorder() });
   let sessions = 1;
   let director = newDirector(sessions);
+  if (classic) director.setClassic(true); // saved, so later sessions load it too
   const bot = createBot(skill, seeded(seed + 2000));
   const runs = [];
   for (let i = 0; i < RUNS; i++) {
@@ -255,66 +288,131 @@ function runBot(skill, seed) {
 }
 
 const mean = (xs) => xs.reduce((s, v) => s + v, 0) / Math.max(xs.length, 1);
-const f = (v, d = 2) => (v === null || v === undefined ? '—' : v.toFixed(d));
-// Hit rate = share of obstacle-carrying waves that hit the player (targetRisk is per wave).
-const waveHitRate = (rs) => rs.reduce((s, r) => s + r.waveHits, 0) / Math.max(1, rs.reduce((s, r) => s + r.wavesFaced, 0));
-const obstacleHitRate = (rs) => rs.reduce((s, r) => s + r.hits, 0) / Math.max(1, rs.reduce((s, r) => s + r.passes, 0));
+const sum = (xs, fn) => xs.reduce((s, x) => s + fn(x), 0);
+const f = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v) ? '—' : v.toFixed(d));
+// Spread of run lengths across bots: coefficient of variation of the per-bot mean lengths
+// (scale-free, so a director that lengthens everyone's runs is not penalised for that alone).
+const spread = (lengths) => {
+  const m = mean(lengths);
+  return Math.sqrt(mean(lengths.map((l) => (l - m) ** 2))) / m;
+};
 
-const results = [];
-const started = Date.now();
-const SEED = Number(process.env.SIM_SEED || 0); // vary to check robustness
-for (const [skill, seed] of [[0.2, 11], [0.5, 22], [0.9, 33]]) {
-  const { runs, sessions } = runBot(skill, seed + SEED);
-  const tail = runs.slice(-20);
-  const head10 = runs.slice(0, 10), tail10 = runs.slice(-10);
-  const last = runs[runs.length - 1];
-  const res = {
-    skill, sessions,
-    hitRateAll: waveHitRate(runs),
-    hitRateLast20: waveHitRate(tail),
-    obstacleHitRateLast20: obstacleHitRate(tail),
-    targetRiskLast20: mean(tail.map((r) => r.targetRisk ?? 0)),
-    lenFirst10: mean(head10.map((r) => r.duration)),
-    lenLast10: mean(tail10.map((r) => r.duration)),
-    lenAll: mean(runs.map((r) => r.duration)),
-    finalSkill: last.skill,
-    finalTargetTension: last.targetTension,
-    finalSpeedMul: last.speedMul,
-    waves: runs.reduce((acc, r) => { for (const k in r.waves) acc[k] = (acc[k] || 0) + r.waves[k]; return acc; }, {}),
+// ---------- Acceptance thresholds ----------
+const BOTS = [[0.2, 11], [0.5, 22], [0.9, 33]];
+const BASE_SEED = Number(process.env.SIM_SEED || 0);
+const SEEDS = [0, 1, 2, 3, 4].map((s) => BASE_SEED + s);
+const VERBOSE = process.env.SIM_VERBOSE === '1';
+const TAIL = 20;                 // checks A, B and the spread in C use each bot's last 20 runs
+const TRACK_TOL = 0.05;          // A: |realised wave hit rate − mean targetRisk at placement|
+// B: obstacles binned by the risk model's prediction at placement; a bin passes when its
+// observed hit rate is within max(CAL_TOL, CAL_SE × standard error) of its mean prediction.
+const CAL_BINS = [0, 0.02, 0.05, 0.1, 0.2, 1];
+const CAL_MIN_N = 100;           // smaller bins are reported but not judged
+const CAL_TOL = 0.03;
+const CAL_SE = 3;
+
+function calibrationBins(records) {
+  return CAL_BINS.slice(0, -1).map((lo, i) => {
+    const hi = CAL_BINS[i + 1];
+    const inBin = records.filter(([p]) => p >= lo && (p < hi || (hi === 1 && p <= 1)));
+    const n = inBin.length;
+    const predicted = n ? sum(inBin, ([p]) => p) / n : NaN;
+    const observed = n ? inBin.filter(([, hit]) => hit).length / n : NaN;
+    const se = n ? Math.sqrt(Math.max(predicted * (1 - predicted), 1e-4) / n) : NaN;
+    const tol = Math.max(CAL_TOL, CAL_SE * se);
+    const judged = n >= CAL_MIN_N;
+    return { lo, hi, n, predicted, observed, tol, judged, ok: !judged || Math.abs(observed - predicted) <= tol };
+  });
+}
+
+function summarise(skill, { runs, sessions }) {
+  const tail = runs.slice(-TAIL);
+  const targetedWaves = sum(tail, (r) => r.targetedWaves);
+  return {
+    skill, sessions, runs,
+    realised: targetedWaves ? sum(tail, (r) => r.targetedHits) / targetedWaves : NaN,
+    target: targetedWaves ? sum(tail, (r) => r.targetedRiskSum) / targetedWaves : NaN,
+    targetedWaves,
+    bins: calibrationBins(tail.flatMap((r) => r.calibration)),
+    lenFirst10: mean(runs.slice(0, 10).map((r) => r.duration)),
+    lenLast10: mean(runs.slice(-10).map((r) => r.duration)),
+    lenTail: mean(tail.map((r) => r.duration)),
+    violations: runs.flatMap((r) => r.violations),
+    last: runs[runs.length - 1],
   };
-  results.push(res);
-  console.log(`\nBot skill ${skill}  (${sessions} sessions)`);
-  console.log('  run  len(s)  waveHits/waves  hits/near/passes  targetRisk  speed×  gap×  skill  targetTension  conf');
-  runs.forEach((r, i) => {
+}
+
+function printRuns(res) {
+  console.log(`\n  Bot skill ${res.skill}  (${res.sessions} sessions)`);
+  console.log('    run  len(s)  waveHits/waves  hits/near/passes  targetRisk  speed×  gap×  skill  targetTension  conf');
+  res.runs.forEach((r, i) => {
     if (i < 5 || i % 5 === 4) {
-      console.log(`  ${String(i + 1).padStart(3)}  ${f(r.duration, 0).padStart(6)}${r.quit ? 'q' : ' '} ${`${r.waveHits}/${r.wavesFaced}`.padStart(14)}  ${`${r.hits}/${r.nearMisses}/${r.passes}`.padStart(16)}  ${f(r.targetRisk).padStart(10)}  ${f(r.speedMul).padStart(6)}  ${f(r.gapMul).padStart(4)}  ${f(r.skill).padStart(5)}  ${f(r.targetTension).padStart(13)}  ${f(r.confidence)}`);
+      console.log(`    ${String(i + 1).padStart(3)}  ${f(r.duration, 0).padStart(6)}${r.quit ? 'q' : ' '} ${`${r.waveHits}/${r.wavesFaced}`.padStart(14)}  ${`${r.hits}/${r.nearMisses}/${r.passes}`.padStart(16)}  ${f(r.targetRisk).padStart(10)}  ${f(r.speedMul).padStart(6)}  ${f(r.gapMul).padStart(4)}  ${f(r.skill).padStart(5)}  ${f(r.targetTension).padStart(13)}  ${f(r.confidence)}`);
     }
   });
 }
 
-console.log('\nSUMMARY (last 20 runs unless noted)');
-console.log('  bot  waveHitRate  obstacleHitRate  targetRisk  meanLen(all)  len first10→last10  skill  targetTension  speed×  waves(all)');
-for (const r of results) {
-  console.log(`  ${r.skill.toFixed(1)}  ${f(r.hitRateLast20).padStart(11)}  ${f(r.obstacleHitRateLast20).padStart(15)}  ${f(r.targetRiskLast20).padStart(10)}  ${f(r.lenAll, 0).padStart(12)}  ${`${f(r.lenFirst10, 0)} → ${f(r.lenLast10, 0)}`.padStart(18)}  ${f(r.finalSkill).padStart(5)}  ${f(r.finalTargetTension).padStart(13)}  ${f(r.finalSpeedMul).padStart(6)}  ${JSON.stringify(r.waves)}`);
+const started = Date.now();
+const overview = []; // [seed, check, ok]
+for (const seed of SEEDS) {
+  const personal = BOTS.map(([skill, s]) => summarise(skill, runBot(skill, s + seed)));
+  const classic = BOTS.map(([skill, s]) => summarise(skill, runBot(skill, s + seed, { classic: true })));
+  const checks = [];
+  const check = (id, label, ok) => { checks.push([id, label, ok]); overview.push([seed, id, ok]); };
+
+  console.log(`\n================ SEED ${seed} ================`);
+  if (VERBOSE) personal.forEach(printRuns);
+
+  console.log(`  bot  realised  target  waves   len first10→last10  len(last ${TAIL}) personal / classic  skill  speed×`);
+  personal.forEach((r, i) => {
+    console.log(`  ${r.skill.toFixed(1)}  ${f(r.realised, 3).padStart(8)}  ${f(r.target, 3).padStart(6)}  ${String(r.targetedWaves).padStart(5)}  ${`${f(r.lenFirst10, 0)} → ${f(r.lenLast10, 0)}`.padStart(19)}  ${`${f(r.lenTail, 0)} / ${f(classic[i].lenTail, 0)}`.padStart(28)}  ${f(r.last.skill).padStart(5)}  ${f(r.last.speedMul).padStart(6)}`);
+  });
+
+  // A. Realised wave hit rate tracks the targetRisk the waves were placed under.
+  for (const r of personal) {
+    const gap = Math.abs(r.realised - r.target);
+    check('A', `bot ${r.skill}: |realised ${f(r.realised, 3)} − target ${f(r.target, 3)}| = ${f(gap, 3)} ≤ ${TRACK_TOL}`, gap <= TRACK_TOL);
+  }
+
+  // B. Risk-model calibration per predicted-risk bin.
+  console.log(`  calibration (last ${TAIL} runs): bin  n  predicted → observed  (tol)`);
+  for (const r of personal) {
+    for (const b of r.bins) {
+      if (!b.n) continue;
+      console.log(`    bot ${r.skill}  [${b.lo}, ${b.hi})  ${String(b.n).padStart(5)}  ${f(b.predicted, 3)} → ${f(b.observed, 3)}  (±${f(b.tol, 3)})${b.judged ? (b.ok ? '' : '  OFF') : '  (too few, not judged)'}`);
+    }
+    const judged = r.bins.filter((b) => b.judged);
+    const bad = judged.filter((b) => !b.ok).map((b) => `[${b.lo}, ${b.hi})`);
+    check('B', `bot ${r.skill}: ${judged.length - bad.length}/${judged.length} judged risk bins calibrated${bad.length ? ` (off: ${bad.join(' ')})` : ''}`,
+      judged.length > 0 && bad.length === 0);
+  }
+
+  // C. Mid bot's runs don't get shorter; spread across bots shrinks vs. Classic mode.
+  const mid = personal[1];
+  check('C', `mid bot runs do not get shorter (${f(mid.lenFirst10, 0)}s → ${f(mid.lenLast10, 0)}s)`, mid.lenLast10 >= mid.lenFirst10);
+  const sp = spread(personal.map((r) => r.lenTail)), sc = spread(classic.map((r) => r.lenTail));
+  check('C', `run-length spread across bots (CV) ${f(sp)} < classic ${f(sc)}`, sp < sc);
+
+  // D. Guardrail clamps never exceeded (personalised and classic runs, every tick).
+  for (const [label, set] of [['personal', personal], ['classic', classic]]) {
+    const v = set.flatMap((r) => r.violations);
+    check('D', `${label}: guardrail clamps never exceeded${v.length ? ` (${v.slice(0, 3).join('; ')})` : ''}`, v.length === 0);
+  }
+
+  console.log('  ACCEPTANCE');
+  for (const [id, label, ok] of checks) console.log(`    ${ok ? 'PASS' : 'FAIL'}  ${id}  ${label}`);
 }
 
-// Acceptance. "Target band" = the targetRisk clamp [0.05, 0.45]; the stricter tracking of the
-// director's current targetRisk is reported alongside for information.
-const BAND = [0.05, 0.45];
-const checks = [];
-for (const r of results) {
-  checks.push([`bot ${r.skill}: wave hit rate ${f(r.hitRateLast20)} within ±0.08 of target band [${BAND}]`,
-    r.hitRateLast20 >= BAND[0] - 0.08 && r.hitRateLast20 <= BAND[1] + 0.08]);
+console.log('\nOVERVIEW (seed × check: failures / total)');
+console.log(`  seed  ${['A', 'B', 'C', 'D'].map((c) => c.padStart(5)).join('')}`);
+for (const seed of SEEDS) {
+  const cells = ['A', 'B', 'C', 'D'].map((id) => {
+    const rows = overview.filter(([s, c]) => s === seed && c === id);
+    const failed = rows.filter(([, , ok]) => !ok).length;
+    return `${failed ? `${failed}✗` : '✓'}/${rows.length}`.padStart(5);
+  });
+  console.log(`  ${String(seed).padStart(4)}  ${cells.join('')}`);
 }
-const weak = results[0], strong = results[2];
-checks.push([`weak bot runs get longer (${f(weak.lenFirst10, 0)}s → ${f(weak.lenLast10, 0)}s)`, weak.lenLast10 > weak.lenFirst10]);
-checks.push([`strong bot speed multiplier above 1 (${f(strong.finalSpeedMul)})`, strong.finalSpeedMul > 1]);
-console.log('\nACCEPTANCE');
-for (const [label, ok] of checks) console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${label}`);
-console.log('\nINFO: tracking of the current targetRisk (|waveHitRate − targetRisk| ≤ 0.08)');
-for (const r of results) {
-  const gap = Math.abs(r.hitRateLast20 - r.targetRiskLast20);
-  console.log(`  ${gap <= 0.08 ? 'ok  ' : 'off '}  bot ${r.skill}: ${f(r.hitRateLast20)} vs ${f(r.targetRiskLast20)}`);
-}
-console.log(`\n(${((Date.now() - started) / 1000).toFixed(1)} s)`);
-if (checks.some(([, ok]) => !ok)) process.exitCode = 1;
+const failures = overview.filter(([, , ok]) => !ok).length;
+console.log(`\n${failures ? `FAILED: ${failures} of ${overview.length} checks` : `ALL ${overview.length} CHECKS PASSED`}  (${((Date.now() - started) / 1000).toFixed(1)} s)`);
+if (failures) process.exit(1);

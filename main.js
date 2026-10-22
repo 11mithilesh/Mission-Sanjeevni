@@ -6,6 +6,8 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createDirector } from './personalization/director.js';
 import { createDebugOverlay } from './personalization/debug-overlay.js';
+import { createBestScoreStore } from './personalization/best-score.js';
+import { classifyObstaclePass } from './personalization/obstacles.js';
 
 /* =========================================================
    NEON DRIFT — a synthwave flyer in Three.js
@@ -21,10 +23,7 @@ const ui = {
   power: $('power'), powerFill: $('power-fill'),
 };
 
-const store = {
-  get() { try { return parseInt(localStorage.getItem('neon-drift-best') || '0', 10) || 0; } catch { return 0; } },
-  set(v) { try { localStorage.setItem('neon-drift-best', String(v)); } catch { /* storage unavailable */ } },
-};
+const store = createBestScoreStore();
 
 // ---------- Personalisation ----------
 // The director learns locally how this player flies and tunes pacing; see README.
@@ -963,9 +962,6 @@ function chooseRegionStormModel() {
   const selected = choices[director.pickStormTheme(choices.map(({ file }) => file))];
   selectedStormCloudModel = selected.model;
   selectedStormTheme = selected.file;
-  for (const entity of entities) {
-    if (entity.type === 'crystal') setObstacleModel(entity.mesh, selectedStormCloudModel);
-  }
 }
 
 // ---------- World objects (pooled) ----------
@@ -1191,6 +1187,7 @@ function spawn(type, x, y, z, variant = 'ram') {
   e.waveId = null;    // which wave spawned it, for outcome attribution
   e.features = null;  // risk features at placement time (obstacles only)
   e.side = 0;
+  e.stormTheme = type === 'crystal' ? selectedStormTheme : null;
   entities.push(e);
   return e;
 }
@@ -1377,7 +1374,8 @@ const sfx = {
 const state = {
   mode: 'menu', // menu | playing | paused | dying | over
   score: 0,
-  best: store.get(),
+  runMode: 'adaptive', // mode the current/last run was played in; its best score is `best`
+  best: 0,
   shield: 100,
   combo: 0,
   powerCharges: 3,
@@ -1388,8 +1386,19 @@ const state = {
   invuln: 0,
   shake: 0,
 };
-ui.bestMenu.textContent = state.best.toLocaleString();
-ui.bestHud.textContent = state.best.toLocaleString();
+// Adaptive and Classic keep separate best scores; the displays follow the selected mode.
+const selectedMode = () => (director.model.classic ? 'classic' : 'adaptive');
+function showBest(mode = selectedMode()) {
+  const best = store.get(mode).toLocaleString();
+  const label = mode === 'classic' ? 'Classic' : 'Adaptive';
+  ui.bestMenu.textContent = best;
+  ui.bestHud.textContent = best;
+  ui.finalBest.textContent = best;
+  document.querySelectorAll('.best-mode').forEach((el) => { el.textContent = label; });
+}
+state.runMode = selectedMode();
+state.best = store.get(state.runMode);
+showBest();
 
 const multiplier = () => Math.min(8, 1 + Math.floor(state.combo / 4));
 function updatePowerBar() {
@@ -1417,6 +1426,9 @@ function startGame() {
   nextPlaceIndex = 0;
   showPlaceName();
   nextRiverChange = director.regionInterval();
+  state.runMode = selectedMode(); // a toggle on the game-over panel can't re-file this run
+  state.best = store.get(state.runMode);
+  showBest(state.runMode);
   Object.assign(state, { mode: 'playing', score: 0, shield: 100, combo: 0, powerCharges: 3, runTime: 0, dist: 0, nextSpawn: 40, invuln: 1, shake: 0 });
   updatePowerBar();
   ui.power.disabled = false;
@@ -1442,16 +1454,14 @@ function gameOver() {
   sfx.boom();
   const final = Math.floor(state.score);
   const isBest = final > state.best;
-  if (isBest) { state.best = final; store.set(final); }
+  if (isBest) { state.best = final; store.set(state.runMode, final); }
   director.onEvent({ type: 'run_end', duration: state.runTime, score: final, cause: 'shield' });
   director.save();
   setTimeout(() => {
     state.mode = 'over';
     ui.hud.classList.add('hidden');
     ui.finalScore.textContent = final.toLocaleString();
-    ui.finalBest.textContent = state.best.toLocaleString();
-    ui.bestMenu.textContent = state.best.toLocaleString();
-    ui.bestHud.textContent = state.best.toLocaleString();
+    showBest(state.runMode);
     ui.newBest.classList.toggle('hidden', !isBest);
     ui.over.classList.remove('hidden');
     ui.restart.focus();
@@ -1577,6 +1587,7 @@ classicToggles.forEach((box) => {
   box.addEventListener('change', () => {
     director.setClassic(box.checked);
     classicToggles.forEach((other) => { other.checked = box.checked; });
+    showBest();
   });
 });
 document.querySelectorAll('.reset-learning').forEach((button) => {
@@ -1663,10 +1674,10 @@ function updateEntities(dt, dz, t) {
         const dzn = zc / (e.rx + 0.8);
         const d2 = dx * dx + dy * dy + dzn * dzn; // < 1 means inside the collision ellipsoid
         if (state.invuln <= 0 && d2 < 1) { reportObstacle(e, 'hit'); onHit(e); removeAt(i); continue; }
-        if (!e.passed && zOld < sp.z && zNew >= sp.z) {
+        const outcome = classifyObstaclePass({ zc, rx: e.rx, d2, passed: e.passed });
+        if (outcome !== null) {
           e.passed = true;
-          // Near miss: within 1.5× the collision radius. Passes during invulnerability teach nothing.
-          reportObstacle(e, d2 < 1 ? 'ignored' : d2 < 2.25 ? 'nearMiss' : 'clean');
+          reportObstacle(e, outcome);
         }
       }
     } else if (e.type === 'orb') {
@@ -1709,8 +1720,8 @@ function updateEntities(dt, dz, t) {
 
 function reportObstacle(e, outcome) {
   director.onEvent({
-    type: 'obstacle_pass', features: e.features, side: e.side, outcome, theme: selectedStormTheme,
-    waveId: e.passed && outcome === 'hit' ? null : e.waveId, // a late hit just behind the ship: wave already counted
+    type: 'obstacle_pass', features: e.features, side: e.side, outcome, theme: e.stormTheme,
+    waveId: e.waveId,
   });
 }
 

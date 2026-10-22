@@ -23,8 +23,8 @@ export function createDebugOverlay(director, { visible = false } = {}) {
     const lines = [
       `DIRECTOR ${m.classic ? '(classic mode)' : ''}`,
       `confidence     ${fmt(director.confidence)}   obs ${m.profile.observations}   runs ${m.profile.runs}`,
-      `tension        ${fmt(director.tension)} / target ${fmt(d.targetTension)}`,
-      `targetRisk     ${fmt(d.targetRisk)}`,
+      `tension        ${fmt(director.tension)} / target ${fmt(d.targetTension)}   felt ${fmt(director.felt)}`,
+      `brake          ${fmt(director.brake)}   targetRisk ${fmt(d.targetRisk)} (budget/wave)`,
       `speed× ${fmt(director.speedMultiplier())} (raw ${fmt(d.speedMul)})  gap× ${fmt(director.spawnGapMultiplier())} (raw ${fmt(d.gapMul)})`,
       `skill ${fmt(d.skill)}  follow ${fmt(director.steeringFollow(), 1)}  reach ${fmt(m.profile.reach, 1)}  react ${fmt(m.profile.reaction)}s`,
       `hitRate ${fmt(m.profile.recentHitRate)}  weak L/R ${fmt(m.profile.hitLeft)}/${fmt(m.profile.hitRight)}`,

@@ -304,6 +304,7 @@ button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 4px; }
   text-shadow: 0 0 8px rgba(255, 104, 130, 0.95), 0 0 18px rgba(255, 38, 63, 0.55);
 }
 .label span { color: var(--gold); }
+.best .best-mode, .label .best-mode { color: inherit; font-weight: inherit; }
 #score {
   font-family: 'Orbitron', sans-serif;
   font-weight: 900;
