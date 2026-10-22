@@ -94,7 +94,7 @@ function guard(violations, name, value, [lo, hi]) {
 }
 function checkGuardrails(director, t, violations) {
   const d = director.model.director;
-  for (const key of ['speedMul', 'targetRisk', 'gapMul', 'targetTension', 'skill']) guard(violations, key, d[key], LIMITS[key]);
+  for (const key of ['speedMul', 'riskMul', 'gapMul', 'targetTension', 'skill']) guard(violations, key, d[key], LIMITS[key]);
   guard(violations, 'speedMultiplier()', director.speedMultiplier(), LIMITS.speedMul);
   guard(violations, 'spawnGapMultiplier()', director.spawnGapMultiplier(), LIMITS.gapMul);
   guard(violations, 'steeringFollow()', director.steeringFollow(), LIMITS.follow);
@@ -111,7 +111,7 @@ function playRun(director, bot, rng) {
   const st = { shield: 100, invuln: 1, runTime: 0, dist: 0, nextSpawn: 40, powerCharges: 3 };
   let gateCount = 0;
   const waveStats = new Map(); // wave id -> did any of its obstacles hit the player?
-  const waveTargets = new Map(); // wave id -> director targetRisk when the wave was placed
+  const wavePredicted = new Map(); // wave id -> predicted P(wave hits) at placement: 1 − Π(1 − risk)
   const calibration = [];        // [predicted risk at placement, hit?] per resolved obstacle
   const violations = [];
   let nearMisses = 0;
@@ -125,6 +125,7 @@ function playRun(director, bot, rng) {
   const shipCtx = () => ({ ...world.ship });
   const crystal = (wave, x, y, z, s, sy, xRange = null, yRange = null, count = 1) => {
     const p = director.placeObstacle({ waveId: wave.id, x, y, z, s, sy, xRange, yRange, count, fixed: !xRange, ship: shipCtx(), speed: world.speed });
+    wavePredicted.set(wave.id, 1 - (1 - (wavePredicted.get(wave.id) ?? 0)) * (1 - p.risk));
     world.entities.push({
       type: 'crystal', x: p.x, y: p.y, z: p.z, rx: 1.9 * p.s, ry: 1.1 * p.s * p.sy,
       passed: false, waveId: wave.id, features: p.features, side: p.side, theme, risk: p.risk,
@@ -186,7 +187,6 @@ function playRun(director, bot, rng) {
       let obstacles = 0;
       for (const e of world.entities) if (e.type === 'crystal') obstacles++;
       const wave = director.chooseWave({ runTime: st.runTime, shield: st.shield, powerCharges: st.powerCharges, obstacles });
-      if (director.confidence > 0) waveTargets.set(wave.id, director.model.director.targetRisk);
       waves[wave.arm]++;
       W[wave.arm](wave.d, wave);
       director.onEvent({ type: 'wave_spawn', id: wave.id, arm: wave.arm });
@@ -235,7 +235,7 @@ function playRun(director, bot, rng) {
     }
 
     director.tick(DT, { playing: true, ship: world.ship, target: world.target, boost: false });
-    if (director.confidence > 0) { riskSum += director.model.director.targetRisk * DT; riskTime += DT; }
+    if (director.confidence > 0) { riskSum += director.model.director.riskMul * DT; riskTime += DT; }
     checkGuardrails(director, st.runTime, violations);
   }
 
@@ -244,15 +244,15 @@ function playRun(director, bot, rng) {
   director.onEvent({ type: 'run_end', duration, score: 0, cause });
   director.save();
   const m = director.model.director;
-  // Waves placed under personalisation that reached the player: realised hit vs. target at placement.
-  const targeted = [...waveStats].filter(([id]) => waveTargets.has(id));
+  // Storm-carrying waves that reached the player: realised hit vs. predicted wave risk at placement.
+  const faced = [...waveStats].filter(([id]) => wavePredicted.has(id));
   return {
     duration, cause, hits, passes, nearMisses, waves, calibration, violations,
     waveHits: [...waveStats.values()].filter(Boolean).length, wavesFaced: waveStats.size,
-    targetedWaves: targeted.length,
-    targetedHits: targeted.filter(([, hit]) => hit).length,
-    targetedRiskSum: targeted.reduce((s, [id]) => s + waveTargets.get(id), 0),
-    targetRisk: riskTime ? riskSum / riskTime : null,
+    targetedWaves: faced.length,
+    targetedHits: faced.filter(([, hit]) => hit).length,
+    targetedRiskSum: faced.reduce((s, [id]) => s + wavePredicted.get(id), 0),
+    riskMul: riskTime ? riskSum / riskTime : null,
     speedMul: director.speedMultiplier(), rawSpeedMul: m.speedMul, gapMul: m.gapMul,
     skill: m.skill, targetTension: m.targetTension, confidence: director.confidence,
   };
@@ -300,7 +300,7 @@ const BASE_SEED = Number(process.env.SIM_SEED || 0);
 const SEEDS = [0, 1, 2, 3, 4].map((s) => BASE_SEED + s);
 const VERBOSE = process.env.SIM_VERBOSE === '1';
 const TAIL = 20;                 // checks A, B and the spread in C use each bot's last 20 runs
-const TRACK_TOL = 0.05;          // A: |realised wave hit rate − mean targetRisk at placement|
+const TRACK_TOL = 0.05;          // A: |realised wave hit rate − mean predicted wave risk at placement|
 // B: obstacles binned by the risk model's prediction at placement; a bin passes when its
 // observed hit rate is within max(CAL_TOL, CAL_SE × standard error) of its mean prediction.
 const CAL_BINS = [0, 0.02, 0.05, 0.1, 0.2, 1];
@@ -341,10 +341,10 @@ function summarise(skill, { runs, sessions }) {
 
 function printRuns(res) {
   console.log(`\n  Bot skill ${res.skill}  (${res.sessions} sessions)`);
-  console.log('    run  len(s)  waveHits/waves  hits/near/passes  targetRisk  speed×  gap×  skill  targetTension  conf');
+  console.log('    run  len(s)  waveHits/waves  hits/near/passes     riskMul  speed×  gap×  skill  targetTension  conf');
   res.runs.forEach((r, i) => {
     if (i < 5 || i % 5 === 4) {
-      console.log(`    ${String(i + 1).padStart(3)}  ${f(r.duration, 0).padStart(6)}${r.quit ? 'q' : ' '} ${`${r.waveHits}/${r.wavesFaced}`.padStart(14)}  ${`${r.hits}/${r.nearMisses}/${r.passes}`.padStart(16)}  ${f(r.targetRisk).padStart(10)}  ${f(r.speedMul).padStart(6)}  ${f(r.gapMul).padStart(4)}  ${f(r.skill).padStart(5)}  ${f(r.targetTension).padStart(13)}  ${f(r.confidence)}`);
+      console.log(`    ${String(i + 1).padStart(3)}  ${f(r.duration, 0).padStart(6)}${r.quit ? 'q' : ' '} ${`${r.waveHits}/${r.wavesFaced}`.padStart(14)}  ${`${r.hits}/${r.nearMisses}/${r.passes}`.padStart(16)}  ${f(r.riskMul).padStart(10)}  ${f(r.speedMul).padStart(6)}  ${f(r.gapMul).padStart(4)}  ${f(r.skill).padStart(5)}  ${f(r.targetTension).padStart(13)}  ${f(r.confidence)}`);
     }
   });
 }
@@ -360,15 +360,15 @@ for (const seed of SEEDS) {
   console.log(`\n================ SEED ${seed} ================`);
   if (VERBOSE) personal.forEach(printRuns);
 
-  console.log(`  bot  realised  target  waves   len first10→last10  len(last ${TAIL}) personal / classic  skill  speed×`);
+  console.log(`  bot  realised  predicted  waves   len first10→last10  len(last ${TAIL}) personal / classic  skill  speed×`);
   personal.forEach((r, i) => {
-    console.log(`  ${r.skill.toFixed(1)}  ${f(r.realised, 3).padStart(8)}  ${f(r.target, 3).padStart(6)}  ${String(r.targetedWaves).padStart(5)}  ${`${f(r.lenFirst10, 0)} → ${f(r.lenLast10, 0)}`.padStart(19)}  ${`${f(r.lenTail, 0)} / ${f(classic[i].lenTail, 0)}`.padStart(28)}  ${f(r.last.skill).padStart(5)}  ${f(r.last.speedMul).padStart(6)}`);
+    console.log(`  ${r.skill.toFixed(1)}  ${f(r.realised, 3).padStart(8)}  ${f(r.target, 3).padStart(9)}  ${String(r.targetedWaves).padStart(5)}  ${`${f(r.lenFirst10, 0)} → ${f(r.lenLast10, 0)}`.padStart(19)}  ${`${f(r.lenTail, 0)} / ${f(classic[i].lenTail, 0)}`.padStart(28)}  ${f(r.last.skill).padStart(5)}  ${f(r.last.speedMul).padStart(6)}`);
   });
 
-  // A. Realised wave hit rate tracks the targetRisk the waves were placed under.
+  // A. Realised wave hit rate tracks the wave risk predicted when the waves were placed.
   for (const r of personal) {
     const gap = Math.abs(r.realised - r.target);
-    check('A', `bot ${r.skill}: |realised ${f(r.realised, 3)} − target ${f(r.target, 3)}| = ${f(gap, 3)} ≤ ${TRACK_TOL}`, gap <= TRACK_TOL);
+    check('A', `bot ${r.skill}: |realised ${f(r.realised, 3)} − predicted ${f(r.target, 3)}| = ${f(gap, 3)} ≤ ${TRACK_TOL}`, gap <= TRACK_TOL);
   }
 
   // B. Risk-model calibration per predicted-risk bin.

@@ -13,10 +13,15 @@
    Objective: the shield takes 3 hits, so hits are far too
    rare and too costly to steer by. Tension comes from near
    misses (and calms on clean waves); the controller aims it
-   at `targetTension`. A hit only engages a brake that cuts
-   the risk budget and eases difficulty for a while. The
-   resulting "felt" level drives both the in-run controller
-   and the between-run `skill` update.
+   at `targetTension`. A hit only engages a brake that eases
+   difficulty for a while. The resulting "felt" level drives
+   both the in-run controller and the between-run `skill`
+   update.
+
+   Difficulty is relative to Classic: storms aim at the
+   classic proposal's risk × `riskMul` (never below its floor
+   × classic), walls keep the classic gap unless riskMul > 1,
+   and the wave mix targets riskMul × the classic mix's rate.
    ========================================================= */
 
 import { createStorage, SCHEMA_VERSION } from './storage.js';
@@ -25,7 +30,7 @@ import {
   defaultProfile, createProfileTracker, weakSide, heatCellCenter, BOUNDS,
 } from './profile.js';
 import { defaultRisk, riskFeatures, predictRisk, updateRisk } from './models/risk.js';
-import { ARMS, defaultBandit, updateBandit, chooseArm } from './models/bandit.js';
+import { ARMS, defaultBandit, updateBandit, chooseArm, banditMean } from './models/bandit.js';
 import { predictShip, missProbability } from './models/reach.js';
 
 // Today's hand-tuned constants (cold start must reproduce these exactly).
@@ -37,27 +42,34 @@ export const FADE_OBSERVATIONS = 250;   // obstacle outcomes until fully persona
 export const CANDIDATES = 24;
 export const VISIBLE_Z = 130;            // roughly where storms emerge from the fog
 export const CLASSIC_SHARE = 0.1;        // share of decisions left classic at full confidence
-// targetRisk is a per-wave hit-probability budget: a ceiling the controller moves, not a goal.
+// riskMul scales storm risk RELATIVE to the classic proposal: each storm aims at
+// classicRisk × riskMul, and is never placed below riskMul's floor × classicRisk.
 export const LIMITS = {
-  speedMul: [0.75, 1.35], targetRisk: [0.02, 0.15], gapMul: [0.7, 1.5],
+  speedMul: [0.75, 1.35], riskMul: [0.7, 1.5], gapMul: [0.7, 1.5],
   targetTension: [0.15, 0.5], skill: [0.5, 2.5], follow: [5, 12], region: [30, 70],
 };
 // Tension controller tuning: gain per unit error, and max change per second.
 const CONTROL = {
   speedMul: { gain: 0.05, rate: 0.01 },
-  targetRisk: { gain: 0.013, rate: 0.002 },
+  riskMul: { gain: 0.08, rate: 0.012 },
   gapMul: { gain: -0.1, rate: 0.015 },
 };
 // Tension is near-miss driven; hits never add to it.
 const TENSION = { nearMiss: 0.12, clean: -0.03, decay: 0.15 };
 // Hit brake: each hit adds `hit` × (hits so far this run), so the last-life brake is strongest.
 // While engaged the controller can only ease; it releases once decayed below `release`.
-// `riskKeep` is the share of targetRisk's headroom above its floor kept on each hit.
+// `riskKeep` is the share of riskMul's headroom above its floor kept on each hit.
 const BRAKE = { hit: 1, weight: 0.5, decay: 0.15, release: 0.15, riskKeep: 0.5 };
 const SKILL_RATE = 0.25; // log-skill change per run at a fully saturated controller push
 
 const clamp = (v, [a, b]) => Math.min(b, Math.max(a, v));
 const lerp = (a, b, k) => a + (b - a) * k;
+
+// Probabilities of today's spawnWave() selection (see chooseWave) at this point of a run.
+function classicArmWeights(runTime, d) {
+  const wall = runTime > 12 ? 0.18 + d * 0.1 : 0;
+  return { wall, scatter: 0.5 - wall, snake: 0.28, gate: 0.22 };
+}
 
 export function defaultModel() {
   return {
@@ -67,7 +79,7 @@ export function defaultModel() {
     risk: defaultRisk(),
     bandit: defaultBandit(),
     director: {
-      targetTension: 0.25, skill: 1, speedMul: 1, gapMul: 1, targetRisk: 0.06,
+      targetTension: 0.25, skill: 1, speedMul: 1, gapMul: 1, riskMul: 1,
     },
   };
 }
@@ -77,8 +89,8 @@ export function createDirector({
   recorder = createRecorder({ persistSummaries: typeof indexedDB !== 'undefined' }),
 } = {}) {
   let { model, fresh } = storage.load();
-  // Models saved under older limits (e.g. targetRisk up to 0.45) are pulled into range.
-  for (const key of ['speedMul', 'targetRisk', 'gapMul', 'targetTension', 'skill']) {
+  // Models saved under older limits are pulled into range.
+  for (const key of ['speedMul', 'riskMul', 'gapMul', 'targetTension', 'skill']) {
     model.director[key] = clamp(model.director[key], LIMITS[key]);
   }
   let tracker = createProfileTracker(model.profile);
@@ -153,8 +165,8 @@ export function createDirector({
   function applyBrake() {
     brake += BRAKE.hit * Math.max(1, run?.hits ?? 1);
     if (confidence > 0) {
-      const [lo] = LIMITS.targetRisk;
-      D().targetRisk = lo + (D().targetRisk - lo) * BRAKE.riskKeep;
+      const [lo] = LIMITS.riskMul;
+      D().riskMul = lo + (D().riskMul - lo) * BRAKE.riskKeep;
     }
   }
 
@@ -228,7 +240,10 @@ export function createDirector({
         arm = 'gate'; variant = ringVariant;
       } else if (personalising()) {
         const allowed = ctx.runTime > 12 ? ARMS : ARMS.filter((a) => a !== 'wall');
-        arm = chooseArm(model.bandit, D().targetRisk, allowed, rng);
+        // Relative target: riskMul × the hit rate the classic wave mix would have now.
+        const mix = classicArmWeights(ctx.runTime, d);
+        const classicHitRate = allowed.reduce((s, a) => s + mix[a] * banditMean(model.bandit[a]), 0);
+        arm = chooseArm(model.bandit, classicHitRate * D().riskMul, allowed, rng);
       } else {
         // Today's spawnWave() selection, unchanged.
         const r = rng();
@@ -250,47 +265,55 @@ export function createDirector({
       let { x, y } = ctx;
       let features = featuresFor(x, y, ctx, pred);
       let risk = predictRisk(model.risk, features);
-      let personal = false;
+      const classicRisk = risk;
+      let personal = false, goal = classicRisk;
       if (!ctx.fixed && ctx.xRange && personalising()) {
         personal = true;
-        // targetRisk is per wave; split it across the wave's obstacles.
-        const perObstacle = 1 - Math.pow(1 - D().targetRisk, 1 / Math.max(1, ctx.count ?? 1));
-        const goal = perObstacle + (rng() - 0.5) * 0.06 * perObstacle / D().targetRisk;
-        let bestGap = Infinity;
+        // Aim at the classic proposal's risk scaled by riskMul (±5% jitter). The classic spot
+        // is the fallback, and no candidate below the floor is ever taken.
+        goal = classicRisk * D().riskMul * (1 + (rng() - 0.5) * 0.1);
+        const floor = LIMITS.riskMul[0] * classicRisk;
+        let bestGap = Math.abs(classicRisk - goal);
         for (let i = 0; i < CANDIDATES; i++) {
           const cx = lerp(ctx.xRange[0], ctx.xRange[1], rng());
           const cy = lerp(ctx.yRange[0], ctx.yRange[1], rng());
           const f = featuresFor(cx, cy, ctx, pred);
           const r = predictRisk(model.risk, f);
-          if (Math.abs(r - goal) < bestGap) {
+          if (r >= floor && Math.abs(r - goal) < bestGap) {
             bestGap = Math.abs(r - goal);
             x = cx; y = cy; features = f; risk = r;
           }
         }
       }
-      if (!ctx.fixed) logDecision({ kind: 'obstacle', x, y, risk, target: D().targetRisk, personal });
-      return { x, y, z: ctx.z, s: ctx.s, sy: ctx.sy, features, risk, side: Math.sign(x - pred.x) };
+      if (!ctx.fixed) logDecision({ kind: 'obstacle', x, y, risk, target: goal, personal });
+      return { x, y, z: ctx.z, s: ctx.s, sy: ctx.sy, features, risk, classicRisk, side: Math.sign(x - pred.x) };
     },
 
     // Choose wall gap column(s). ctx: { cols, gaps (classic), ship, speed, z }
+    // The classic gap stays unless the controller is pushing harder (riskMul > 1); then the
+    // gap whose miss risk is nearest classicRisk × riskMul (never below the floor) is used.
     wallGaps(ctx) {
       if (!personalising()) return ctx.gaps;
       const pred = predictShip(model.profile, ctx.ship, arrival(ctx));
       const warning = Math.min(arrival(ctx), VISIBLE_Z / Math.max(ctx.speed, 1));
-      const options = [];
-      ctx.cols.forEach((_, i) => {
-        options.push([i]);
-        if (i < ctx.cols.length - 1) options.push([i, i + 1]);
-      });
-      const goal = D().targetRisk + (rng() - 0.5) * 0.06;
-      let best = ctx.gaps, bestGap = Infinity, bestRisk = 0;
-      for (const gaps of options) {
+      const riskOf = (gaps) => {
         const gx = gaps.reduce((s, i) => s + ctx.cols[i], 0) / gaps.length;
-        const halfWidth = gaps.length === 1 ? 1.1 : 3.1;
-        const risk = missProbability(model.profile, Math.abs(gx - pred.x), warning, halfWidth);
-        if (Math.abs(risk - goal) < bestGap) { bestGap = Math.abs(risk - goal); best = new Set(gaps); bestRisk = risk; }
+        return missProbability(model.profile, Math.abs(gx - pred.x), warning, gaps.length === 1 ? 1.1 : 3.1);
+      };
+      const classicRisk = riskOf([...ctx.gaps]);
+      let best = ctx.gaps, bestRisk = classicRisk, goal = classicRisk;
+      if (D().riskMul > 1) {
+        goal = classicRisk * D().riskMul;
+        const floor = LIMITS.riskMul[0] * classicRisk;
+        let bestGap = Math.abs(classicRisk - goal);
+        ctx.cols.forEach((_, i) => {
+          for (const gaps of i < ctx.cols.length - 1 ? [[i], [i, i + 1]] : [[i]]) {
+            const risk = riskOf(gaps);
+            if (risk >= floor && Math.abs(risk - goal) < bestGap) { bestGap = Math.abs(risk - goal); best = new Set(gaps); bestRisk = risk; }
+          }
+        });
       }
-      logDecision({ kind: 'wall', x: [...best].join('+'), y: '', risk: bestRisk, target: D().targetRisk, personal: true });
+      logDecision({ kind: 'wall', x: [...best].join('+'), y: '', risk: bestRisk, target: goal, personal: best !== ctx.gaps });
       return best;
     },
 

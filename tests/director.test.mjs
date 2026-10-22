@@ -101,7 +101,7 @@ test('tension controller outputs stay within their clamps', () => {
       director.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false });
       const d = director.model.director;
       assert.ok(director.tension >= 0 && director.tension <= 1);
-      for (const key of ['speedMul', 'targetRisk', 'gapMul']) {
+      for (const key of ['speedMul', 'riskMul', 'gapMul']) {
         assert.ok(d[key] >= LIMITS[key][0] - 1e-12 && d[key] <= LIMITS[key][1] + 1e-12, `${key}=${d[key]}`);
       }
       const follow = director.steeringFollow();
@@ -119,7 +119,7 @@ test('tension controller outputs stay within their clamps', () => {
 test('hits brake instead of adding tension; near misses drive tension', () => {
   const trained = defaultModel();
   trained.profile.observations = 10000;
-  trained.director.targetRisk = 0.12;
+  trained.director.riskMul = 1.3;
   const director = makeDirector({ model: trained });
   director.onEvent({ type: 'run_start' });
   director.onEvent({ type: 'obstacle_pass', outcome: 'nearMiss', features: [1, 0.1, 0.1, 0, 0.2, 1, 0, 0.1] });
@@ -130,14 +130,14 @@ test('hits brake instead of adding tension; near misses drive tension', () => {
   director.onEvent({ type: 'obstacle_pass', outcome: 'hit', features: [1, 0.1, 0.1, 0, 0.2, 1, 0, 0.1] });
   assert.equal(director.tension, afterNearMiss, 'a hit adds no tension');
   assert.ok(director.brake > 0);
-  const [lo] = LIMITS.targetRisk;
-  assert.ok(Math.abs(director.model.director.targetRisk - (lo + (0.12 - lo) / 2)) < 1e-12, 'hit cuts the risk budget');
+  const [lo] = LIMITS.riskMul;
+  assert.ok(Math.abs(director.model.director.riskMul - (lo + (1.3 - lo) / 2)) < 1e-12, 'hit cuts the risk multiplier');
 
   // While braked the controller only eases, even though near-miss tension is below target.
   const before = { ...director.model.director };
   for (let i = 0; i < 60; i++) director.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false });
   assert.ok(director.model.director.speedMul < before.speedMul);
-  assert.ok(director.model.director.targetRisk < before.targetRisk);
+  assert.ok(director.model.director.riskMul < before.riskMul);
   assert.ok(director.model.director.gapMul > before.gapMul);
 
   const firstBrake = director.brake;
@@ -147,14 +147,67 @@ test('hits brake instead of adding tension; near misses drive tension', () => {
 
 test('saved models from older limits are clamped on load', () => {
   const old = defaultModel();
-  old.director.targetRisk = 0.45;
+  old.director.riskMul = 3;
   const director = makeDirector({ model: old });
-  assert.equal(director.model.director.targetRisk, LIMITS.targetRisk[1]);
+  assert.equal(director.model.director.riskMul, LIMITS.riskMul[1]);
+});
+
+test('storms aim relative to the classic proposal and never below the floor', () => {
+  for (const riskMul of [0.7, 1, 1.5]) {
+    const trained = defaultModel();
+    trained.profile.observations = 10000;
+    trained.director.riskMul = riskMul;
+    const director = makeDirector({ model: trained, rng: seeded(3) });
+    director.onEvent({ type: 'run_start' });
+    let placed = 0, classic = 0;
+    for (let i = 0; i < 500; i++) {
+      const px = -8 + (i % 17), py = 1.5 + (i % 5);
+      const p = director.placeObstacle({ waveId: 0, x: px, y: py, z: -200, s: 1, sy: 1.8, xRange: [-8.5, 8.5], yRange: [1.3, 6.8], count: 3, ship, speed: 60 });
+      assert.ok(p.risk >= LIMITS.riskMul[0] * p.classicRisk - 1e-12, `risk ${p.risk} < floor of ${p.classicRisk}`);
+      placed += p.risk; classic += p.classicRisk;
+    }
+    // ~10% of placements stay classic (ratio 1); the rest aim at riskMul.
+    const ratio = placed / classic;
+    assert.ok(Math.abs(ratio - (0.9 * riskMul + 0.1)) < 0.2, `riskMul ${riskMul}: mean risk ratio ${ratio}`);
+  }
+});
+
+test('walls keep the classic gap unless the controller is pushing harder', () => {
+  const wall = { cols: [-8, -4, 0, 4, 8], ship: { x: 0, y: 4, vx: 0, vy: 0 }, speed: 60, z: -230 };
+  for (const riskMul of [0.7, 1]) {
+    const trained = defaultModel();
+    trained.profile.observations = 10000;
+    trained.director.riskMul = riskMul;
+    const director = makeDirector({ model: trained, rng: seeded(4) });
+    director.onEvent({ type: 'run_start' });
+    for (let i = 0; i < 50; i++) {
+      const gaps = new Set([i % 5]);
+      assert.equal(director.wallGaps({ ...wall, gaps }), gaps);
+    }
+  }
+  const trained = defaultModel();
+  trained.profile.observations = 10000;
+  trained.director.riskMul = 1.5;
+  const director = makeDirector({ model: trained, rng: seeded(4) });
+  director.onEvent({ type: 'run_start' });
+  let moved = 0;
+  for (let i = 0; i < 100; i++) {
+    const gaps = i % 2 ? new Set([i % 5]) : new Set([i % 4, (i % 4) + 1]);
+    const chosen = director.wallGaps({ ...wall, ship: { ...wall.ship, x: -8 + (i % 17) }, gaps });
+    const last = director.decisions.at(-1);
+    if (chosen === gaps) continue; // classic exploration share, or classic already nearest
+    moved++;
+    const classicRisk = last.target / 1.5;
+    assert.ok(last.risk >= LIMITS.riskMul[0] * classicRisk, 'never below the floor');
+    assert.ok(Math.abs(last.risk - last.target) < Math.abs(classicRisk - last.target), 'only moves to get nearer the goal');
+  }
+  assert.ok(moved > 0, 'pushing harder moves some gaps');
 });
 
 test('about 10% of decisions stay classic at full confidence', () => {
   const trained = defaultModel();
   trained.profile.observations = 10000;
+  trained.director.riskMul = 1.5; // so personalised placements move away from the classic spot
   const director = makeDirector({ model: trained, rng: seeded(9) });
   director.onEvent({ type: 'run_start' });
   assert.equal(director.confidence, 1);
