@@ -13,8 +13,8 @@
    Objective: the shield takes 3 hits, so hits are far too
    rare and too costly to steer by. Tension comes from near
    misses (and calms on clean waves); the controller aims it
-   at `targetTension`. A hit only engages a brake that eases
-   difficulty for a while. The resulting "felt" level drives
+   at `targetTension`. A hit only engages a fixed 8 s brake
+   that eases difficulty. The resulting "felt" level drives
    both the in-run controller and the between-run `skill`
    update.
 
@@ -22,12 +22,15 @@
    classic proposal's risk × `riskMul` (never below its floor
    × classic), walls keep the classic gap unless riskMul > 1,
    and the wave mix targets riskMul × the classic mix's rate.
+   Speed, spacing and ramp go easier than Classic only for
+   players flagged as struggling (see profile.isStruggling),
+   who are also the only ones offered rescue कवच gates.
    ========================================================= */
 
 import { createStorage, SCHEMA_VERSION } from './storage.js';
 import { createRecorder } from './recorder.js';
 import {
-  defaultProfile, createProfileTracker, weakSide, heatCellCenter, isStruggling, BOUNDS,
+  defaultProfile, createProfileTracker, weakSide, heatCellCenter, isStruggling, engagement, BOUNDS,
 } from './profile.js';
 import { defaultRisk, riskFeatures, predictRisk, updateRisk } from './models/risk.js';
 import { ARMS, defaultBandit, updateBandit, chooseArm, banditMean } from './models/bandit.js';
@@ -56,10 +59,15 @@ const CONTROL = {
 };
 // Tension is near-miss driven; hits never add to it.
 const TENSION = { nearMiss: 0.12, clean: -0.03, decay: 0.15 };
-// Hit brake: each hit adds `hit` × (hits so far this run), so the last-life brake is strongest.
-// While engaged the controller can only ease; it releases once decayed below `release`.
-// `riskKeep` is the share of riskMul's headroom above its floor kept on each hit.
-const BRAKE = { hit: 1, weight: 0.5, decay: 0.15, release: 0.15, riskKeep: 0.5 };
+// Hit brake: a hit eases at a fixed strength for `seconds` of play. Further hits restart the
+// timer; they never extend or strengthen it. While engaged the controller can only ease.
+const BRAKE = { seconds: 8, weight: 0.5 };
+// Pushing harder runs at this share of the easing rate. Near-miss tension sits below target
+// for most players, so with symmetric rates the controller settles where half of play is
+// braked (a hit every 2 × BRAKE.seconds), far harder than Classic. At 1/4 it settles at
+// 20% braked: a hit every ~40 s. Players hit more often than that in Classic are eased;
+// players hit less often are pushed.
+const PUSH_SHARE = 1 / 4;
 const SKILL_RATE = 0.25; // log-skill change per run at a fully saturated controller push
 const RESCUE = { interval: 30, shield: 40 }; // s of run time per rescue gate; shield at or below
 
@@ -160,35 +168,49 @@ export function createDirector({
 
   // The one signal both the in-run controller and the between-run skill update steer by.
   // Without a brake it is the near-miss tension. With one it never reads below target
-  // (so the controller cannot push harder) and sits above it by the brake's strength.
+  // (so the controller cannot push harder) and sits a fixed BRAKE.weight above it.
   function felt() {
-    return brake > 0 ? Math.max(tension, D().targetTension) + BRAKE.weight * brake : tension;
+    return brake > 0 ? Math.max(tension, D().targetTension) + BRAKE.weight : tension;
   }
 
   function applyBrake() {
-    brake += BRAKE.hit * Math.max(1, run?.hits ?? 1);
-    if (confidence > 0) {
-      const [lo] = LIMITS.riskMul;
-      D().riskMul = lo + (D().riskMul - lo) * BRAKE.riskKeep;
-    }
+    brake = BRAKE.seconds;
+  }
+
+  // Easing below Classic speed, spacing or ramp is only for players flagged as struggling.
+  // Storm risk eases below Classic only as far as the player is steering: someone who
+  // doesn't move gets no easier storms (riskMul >= 1), an engaged player down to the floor.
+  function limit(key) {
+    const [lo, hi] = LIMITS[key];
+    if (key === 'riskMul') return [lerp(1, lo, engagement(model.profile)), hi];
+    if (struggling) return LIMITS[key];
+    if (key === 'speedMul' || key === 'skill') return [Math.max(lo, CLASSIC[key]), hi];
+    if (key === 'gapMul') return [lo, Math.min(hi, CLASSIC.gapMul)];
+    return LIMITS[key];
+  }
+
+  // A knob's step this frame as a share of its easing rate limit, signed toward "harder":
+  // in [-1, PUSH_SHARE]. Both the controller and the skill update use it.
+  function push(key, err) {
+    const { gain, rate } = CONTROL[key];
+    const p = clamp(Math.abs(gain) * err / rate, [-1, 1]);
+    return p > 0 ? p * PUSH_SHARE : p;
   }
 
   function stepController(dt) {
     const err = D().targetTension - felt();
     for (const key of Object.keys(CONTROL)) {
       const { gain, rate } = CONTROL[key];
-      const step = Math.max(-rate * dt, Math.min(rate * dt, gain * err * dt));
-      D()[key] = clamp(D()[key] + step, LIMITS[key]);
+      D()[key] = clamp(D()[key] + Math.sign(gain) * push(key, err) * rate * dt, limit(key));
     }
   }
 
-  // How hard the controller is pushing toward "harder", in [-1, 1]: each knob's step as a
-  // share of its rate limit, averaged. Skill learns from this, so a brief brake spike
-  // weighs no more than it does in the controller.
+  // How hard the controller is pushing toward "harder", averaged over knobs. Skill learns
+  // from this, so a brief brake spike weighs no more than it does in the controller.
   function drive() {
     const err = D().targetTension - felt();
     const keys = Object.keys(CONTROL);
-    return keys.reduce((s, k) => s + clamp(Math.abs(CONTROL[k].gain) * err / CONTROL[k].rate, [-1, 1]), 0) / keys.length;
+    return keys.reduce((s, k) => s + push(k, err), 0) / keys.length;
   }
 
   function endRun(e) {
@@ -203,7 +225,7 @@ export function createDirector({
     if (learning() && duration > 10 && run.engagedTime > 5) {
       // Skill: ramp faster next time when the controller spent the run pushing harder,
       // slower when it spent it easing or braking.
-      D().skill = clamp(D().skill * Math.exp(SKILL_RATE * meanDrive), LIMITS.skill);
+      D().skill = clamp(D().skill * Math.exp(SKILL_RATE * meanDrive), limit('skill'));
       // Target tension, learned from how runs end.
       if (e.cause === 'quit' && endFelt > D().targetTension) D().targetTension -= 0.02;
       else if (duration > 1.3 * model.profile.runLength && meanFelt >= 0.9 * D().targetTension) {
@@ -244,10 +266,10 @@ export function createDirector({
         arm = 'gate'; variant = ringVariant;
       } else if (personalising()) {
         const allowed = ctx.runTime > 12 ? ARMS : ARMS.filter((a) => a !== 'wall');
-        // Relative target: riskMul × the hit rate the classic wave mix would have now.
+        // Relative target: the classic mix tilted to riskMul × its own expected hit rate.
         const mix = classicArmWeights(ctx.runTime, d);
         const classicHitRate = allowed.reduce((s, a) => s + mix[a] * banditMean(model.bandit[a]), 0);
-        arm = chooseArm(model.bandit, classicHitRate * D().riskMul, allowed, rng);
+        arm = chooseArm(model.bandit, mix, classicHitRate * D().riskMul, allowed, rng);
       } else {
         // Today's spawnWave() selection, unchanged.
         const r = rng();
@@ -278,9 +300,13 @@ export function createDirector({
         goal = classicRisk * D().riskMul * (1 + (rng() - 0.5) * 0.1);
         const floor = LIMITS.riskMul[0] * classicRisk;
         let bestGap = Math.abs(classicRisk - goal);
+        // Half the candidates slide the classic spot along the line from the predicted ship
+        // (risk falls with distance, so this reaches the goal precisely); half are random.
+        const radial = CANDIDATES / 2;
         for (let i = 0; i < CANDIDATES; i++) {
-          const cx = lerp(ctx.xRange[0], ctx.xRange[1], rng());
-          const cy = lerp(ctx.yRange[0], ctx.yRange[1], rng());
+          const k = 0.4 * Math.pow(4, i / (radial - 1)); // 0.4× … 1.6× the classic distance
+          const cx = i < radial ? clamp(pred.x + (ctx.x - pred.x) * k, ctx.xRange) : lerp(ctx.xRange[0], ctx.xRange[1], rng());
+          const cy = i < radial ? clamp(pred.y + (ctx.y - pred.y) * k, ctx.yRange) : lerp(ctx.yRange[0], ctx.yRange[1], rng());
           const f = featuresFor(cx, cy, ctx, pred);
           const r = predictRisk(model.risk, f);
           if (r >= floor && Math.abs(r - goal) < bestGap) {
@@ -401,8 +427,7 @@ export function createDirector({
       if (!ctx.playing) return;
       clock += dt;
       tension *= Math.exp(-TENSION.decay * dt);
-      brake *= Math.exp(-BRAKE.decay * dt);
-      if (brake < BRAKE.release) brake = 0;
+      brake = Math.max(0, brake - dt);
       // Hold the controller until obstacles actually reach the player this run: the empty
       // opening seconds would otherwise read as "too calm" every run and wind difficulty up.
       if (confidence > 0 && run?.engaged) stepController(dt);
@@ -435,6 +460,8 @@ export function createDirector({
         confidence = computeConfidence();
         struggling = confidence > 0 && isStruggling(model.profile);
         lastRescueAt = 0;
+        // A player no longer struggling loses any below-Classic easing learned meanwhile.
+        if (learning()) for (const key of ['speedMul', 'gapMul', 'skill', 'riskMul']) D()[key] = clamp(D()[key], limit(key));
         // Tension and the brake carry over between runs (they only decay during play), so
         // the strain of a death still counts when the player restarts straight away.
         clock = 0; e.t = 0; sampleTimer = 0;
@@ -464,7 +491,7 @@ export function createDirector({
         const hit = e.outcome === 'hit';
         if (e.outcome === 'nearMiss') addTension(TENSION.nearMiss);
         if (run) { run.engaged = true; if (hit) run.hits++; }
-        if (hit) applyBrake(); // after counting, so the last-life hit brakes hardest
+        if (hit) applyBrake();
         if (e.features && e.outcome !== 'ignored') updateRisk(model.risk, e.features, hit ? 1 : 0);
         const wave = waves.get(e.waveId);
         if (wave) {

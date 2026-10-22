@@ -120,9 +120,13 @@ test('tension controller outputs stay within their clamps', () => {
 test('hits brake instead of adding tension; near misses drive tension', () => {
   const trained = defaultModel();
   trained.profile.observations = 10000;
-  trained.director.riskMul = 1.3;
+  Object.assign(trained.director, { riskMul: 1.3, speedMul: 1.05, gapMul: 0.95 });
   const director = makeDirector({ model: trained });
+  const tick = (seconds) => {
+    for (let i = 0; i < seconds * 30; i++) director.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false });
+  };
   director.onEvent({ type: 'run_start' });
+  assert.equal(director.struggling, false);
   director.onEvent({ type: 'obstacle_pass', outcome: 'nearMiss', features: [1, 0.1, 0.1, 0, 0.2, 1, 0, 0.1] });
   const afterNearMiss = director.tension;
   assert.ok(afterNearMiss > 0);
@@ -130,20 +134,46 @@ test('hits brake instead of adding tension; near misses drive tension', () => {
 
   director.onEvent({ type: 'obstacle_pass', outcome: 'hit', features: [1, 0.1, 0.1, 0, 0.2, 1, 0, 0.1] });
   assert.equal(director.tension, afterNearMiss, 'a hit adds no tension');
-  assert.ok(director.brake > 0);
-  const [lo] = LIMITS.riskMul;
-  assert.ok(Math.abs(director.model.director.riskMul - (lo + (1.3 - lo) / 2)) < 1e-12, 'hit cuts the risk multiplier');
+  assert.equal(director.brake, 8);
+  assert.equal(director.model.director.riskMul, 1.3, 'no immediate cut; easing is the brake');
 
-  // While braked the controller only eases, even though near-miss tension is below target.
-  const before = { ...director.model.director };
-  for (let i = 0; i < 60; i++) director.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false });
-  assert.ok(director.model.director.speedMul < before.speedMul);
-  assert.ok(director.model.director.riskMul < before.riskMul);
-  assert.ok(director.model.director.gapMul > before.gapMul);
+  // While braked the controller only eases, but never below Classic for a non-struggling player.
+  tick(7);
+  const d = director.model.director;
+  assert.ok(d.riskMul < 1.3);
+  assert.equal(d.speedMul, 1, 'speed eased down to Classic, not below');
+  assert.equal(d.gapMul, 1, 'spacing eased up to Classic, not beyond');
+  assert.ok(director.felt > d.targetTension);
 
-  const firstBrake = director.brake;
+  // A second hit restarts the 8 s; it does not add to it.
   director.onEvent({ type: 'obstacle_pass', outcome: 'hit', features: [1, 0.1, 0.1, 0, 0.2, 1, 0, 0.1] });
-  assert.ok(director.brake - firstBrake > 1.5, 'second hit of the run brakes harder');
+  assert.equal(director.brake, 8);
+  tick(8.1);
+  assert.equal(director.brake, 0, 'released after at most 8 s');
+  assert.ok(director.felt < d.targetTension, 'calm again: the controller may push harder');
+});
+
+test('only struggling players are eased below Classic speed, spacing and ramp', () => {
+  for (const struggling of [false, true]) {
+    const trained = defaultModel();
+    trained.profile.observations = 10000;
+    trained.profile.recentRuns = struggling ? [10, 12, 20, 60, 60, 60, 60, 0, 0, 0, 0, 0, 0, 0, 0] : new Array(15).fill(60);
+    Object.assign(trained.director, { speedMul: 0.8, gapMul: 1.4, skill: 0.6 }); // stored while struggling
+    const director = makeDirector({ model: trained });
+    director.onEvent({ type: 'run_start' });
+    assert.equal(director.struggling, struggling);
+    for (let i = 0; i < 20; i++) {
+      director.onEvent({ type: 'obstacle_pass', outcome: 'hit', features: [1, 0.1, 0.1, 0, 0.2, 1, 0, 0.1] });
+      for (let j = 0; j < 60; j++) director.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false });
+    }
+    director.onEvent({ type: 'run_end', duration: 60, score: 0, cause: 'shield' });
+    const d = director.model.director;
+    if (struggling) {
+      assert.ok(d.speedMul < 1 && d.gapMul > 1 && d.skill < 1, JSON.stringify(d));
+    } else {
+      assert.ok(d.speedMul >= 1 && d.gapMul <= 1 && d.skill >= 1, JSON.stringify(d));
+    }
+  }
 });
 
 test('saved models from older limits are clamped on load', () => {

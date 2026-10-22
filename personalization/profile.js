@@ -13,6 +13,10 @@ export const RUN_HISTORY = 15;
 // Struggling: each of the last STRUGGLE.recent runs is shorter than STRUGGLE.share × the
 // median of the recorded runs (needs at least STRUGGLE.minRuns of history).
 export const STRUGGLE = { recent: 3, share: 0.6, minRuns: 6 };
+// Engagement: a ship moving at >= ACTIVE.speed counts as steering; `share` of time moving
+// counts as fully engaged (also the starting value). EWMA over ~20 s of 0.2 s samples.
+export const ACTIVE = { speed: 2, share: 0.2, alpha: 0.01 };
+export const engagement = (p) => Math.min(1, p.activity / ACTIVE.share);
 
 export function defaultProfile() {
   return {
@@ -28,6 +32,7 @@ export function defaultProfile() {
     // storage's type check keeps it.
     recentRuns: new Array(RUN_HISTORY).fill(0),
     boost: 0.1,              // fraction of time spent boosting
+    activity: ACTIVE.share,  // fraction of time the ship is moving (steering engagement)
     shaktiThreat: 3,         // obstacles on screen when Shakti is used
     shaktiPerMin: 0.5,
     themes: {},              // storm theme -> hit rate
@@ -122,6 +127,7 @@ export function createProfileTracker(profile) {
             pendingWaveAt = null;
           }
           lastSpeed = speed;
+          p.activity = ewma(p.activity, speed >= ACTIVE.speed ? 1 : 0, ACTIVE.alpha);
           // Lanes: decayed occupancy heatmap.
           const cell = heatCell(e.x, e.y);
           for (let i = 0; i < p.heat.length; i++) p.heat[i] *= 0.998;
