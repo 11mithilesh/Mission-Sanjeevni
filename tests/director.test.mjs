@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createDirector, defaultModel, LIMITS, CLASSIC } from '../personalization/director.js';
 import { createStorage } from '../personalization/storage.js';
 import { createRecorder } from '../personalization/recorder.js';
-import { isStruggling, createProfileTracker } from '../personalization/profile.js';
+import { isStruggling, createProfileTracker, shaktiStyle } from '../personalization/profile.js';
 import { seeded, memoryBackend } from './helpers.mjs';
 
 const ship = { x: 0, y: 4, vx: 0, vy: 0 };
@@ -321,6 +321,47 @@ test('Seeta refills: only at 0 charges, one in flight, ≥ 30 s apart; never in 
   const classic = makeDirector(); // cold start: confidence 0
   classic.onEvent({ type: 'run_start' });
   for (let t = 0; t < 300; t += 2) assert.equal(classic.chooseWave({ runTime: t, shield: 10, powerCharges: 0, obstacles: 12 }).offered, false);
+});
+
+test('Shakti style from clears, uses per minute and storms on screen', () => {
+  const p = (over) => ({ ...defaultModel().profile, shaktiClears: 20, ...over });
+  assert.equal(shaktiStyle(p({ shaktiClears: 3 })), 'unknown');
+  assert.equal(shaktiStyle(p({ clearThreatShare: 0.7 })), 'panic');
+  assert.equal(shaktiStyle(p({ clearThreatShare: 0.1, shaktiPerMin: 1.2 })), 'convenience');
+  assert.equal(shaktiStyle(p({ clearThreatShare: 0.1, shaktiPerMin: 0.2, shaktiThreat: 6 })), 'convenience');
+  assert.equal(shaktiStyle(p({ clearThreatShare: 0.1, shaktiPerMin: 0.2, shaktiThreat: 2 })), 'mixed');
+  assert.equal(shaktiStyle(p({ clearThreatShare: 0.35 })), 'mixed');
+});
+
+test('convenience Shakti users get rarer refills and a faster push; panic users the base rate', () => {
+  const run = (over) => {
+    const trained = defaultModel();
+    trained.profile.observations = 10000;
+    Object.assign(trained.profile, { shaktiClears: 20, shaktiPerMin: 1.5, recentRuns: new Array(15).fill(60) }, over);
+    const director = makeDirector({ model: trained });
+    director.onEvent({ type: 'run_start' });
+    const offers = [];
+    for (let t = 0; t <= 200; t += 1) {
+      const w = director.chooseWave({ runTime: t, shield: 100, powerCharges: 0, obstacles: 12 });
+      if (w.offered && w.variant === 'seeta') {
+        offers.push(t);
+        director.onEvent({ type: 'gate', passed: true, variant: 'seeta', offered: true });
+      }
+    }
+    // Calm (no tension, no brake): measure the push on speed over 10 s.
+    const before = director.model.director.speedMul;
+    for (let i = 0; i < 300; i++) director.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false });
+    director.onEvent({ type: 'obstacle_pass', outcome: 'clean', features: [1, 1, 1, 0, 0, 1, 0, 0] }); // engage
+    for (let i = 0; i < 300; i++) director.tick(1 / 30, { playing: true, ship, target: { x: 0, y: 4 }, boost: false });
+    return { style: director.shaktiStyle, offers, push: director.model.director.speedMul - before };
+  };
+  const panic = run({ clearThreatShare: 0.8 });
+  const convenience = run({ clearThreatShare: 0.05 });
+  assert.equal(panic.style, 'panic');
+  assert.equal(convenience.style, 'convenience');
+  assert.deepEqual(panic.offers, [30, 60, 90, 120, 150, 180]);
+  assert.deepEqual(convenience.offers, [90, 180]);
+  assert.ok(convenience.push > panic.push * 1.4, `${convenience.push} vs ${panic.push}`);
 });
 
 test('Shakti clears: threats add near-miss tension and are counted; nothing labels the risk model', () => {

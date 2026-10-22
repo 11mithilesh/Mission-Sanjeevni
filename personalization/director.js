@@ -33,7 +33,7 @@
 import { createStorage, SCHEMA_VERSION } from './storage.js';
 import { createRecorder } from './recorder.js';
 import {
-  defaultProfile, createProfileTracker, weakSide, heatCellCenter, isStruggling, engagement, BOUNDS,
+  defaultProfile, createProfileTracker, weakSide, heatCellCenter, isStruggling, engagement, shaktiStyle, BOUNDS,
 } from './profile.js';
 import { defaultRisk, riskFeatures, predictRisk, updateRisk } from './models/risk.js';
 import { ARMS, defaultBandit, updateBandit, chooseArm, banditMean } from './models/bandit.js';
@@ -75,7 +75,11 @@ const SKILL_RATE = 0.25; // log-skill change per run at a fully saturated contro
 const RESCUE = { interval: 30, shield: 40 }; // s of run time per rescue gate; shield at or below
 // Director-offered Seeta Shakti refills: only at 0 charges, one in flight at a time, and at
 // least `cooldown` s of run time between offers (so never more than 1 per 30 s).
-const SEETA = { cooldown: 30 };
+// Shakti style (profile.shaktiStyle): convenience users (mostly far clears) get refills
+// `convenienceSlower`× less often and a faster push; panic users (mostly imminent clears) keep
+// the base refill rate (no extra refills for struggling) and ease via threat-clear tension.
+const SEETA = { cooldown: 30, convenienceSlower: 3 };
+const CONVENIENCE_PUSH = 1.5;
 
 const clamp = (v, [a, b]) => Math.min(b, Math.max(a, v));
 const lerp = (a, b, k) => a + (b - a) * k;
@@ -116,6 +120,7 @@ export function createDirector({
   let lastRescueAt = 0;    // run time of the last rescue gate (0: none before RESCUE.interval)
   let lastSeetaAt = 0;     // run time of the last offered Seeta ring (0: none before the cooldown)
   let seetaPending = false; // an offered Seeta ring is still in flight
+  let style = 'unknown';   // Shakti style, frozen at run start
   let clock = 0;           // run time as seen by the director
   let sampleTimer = 0;
   let nextWaveId = 1;
@@ -202,7 +207,7 @@ export function createDirector({
   function push(key, err) {
     const { gain, rate } = CONTROL[key];
     const p = clamp(Math.abs(gain) * err / rate, [-1, 1]);
-    return p > 0 ? p * PUSH_SHARE : p;
+    return p > 0 ? p * PUSH_SHARE * (style === 'convenience' ? CONVENIENCE_PUSH : 1) : p;
   }
 
   function stepController(dt) {
@@ -262,6 +267,7 @@ export function createDirector({
     get brake() { return brake; },
     get struggling() { return struggling; },
     get seetaPending() { return seetaPending; },
+    get shaktiStyle() { return style; },
     // This run's Shakti clears so far: { threat, far }.
     get runClears() { return { threat: run?.clearedThreat ?? 0, far: run?.clearedFar ?? 0 }; },
     get felt() { return felt(); },
@@ -369,7 +375,8 @@ export function createDirector({
         lastRescueAt = ctx.runTime;
         return 'ram';
       }
-      if (ctx.powerCharges === 0 && !seetaPending && ctx.runTime - lastSeetaAt >= SEETA.cooldown) {
+      const cooldown = SEETA.cooldown * (style === 'convenience' ? SEETA.convenienceSlower : 1);
+      if (ctx.powerCharges === 0 && !seetaPending && ctx.runTime - lastSeetaAt >= cooldown) {
         lastSeetaAt = ctx.runTime;
         seetaPending = true;
         return 'seeta';
@@ -479,6 +486,7 @@ export function createDirector({
       if (e.type === 'run_start') {
         confidence = computeConfidence();
         struggling = confidence > 0 && isStruggling(model.profile);
+        style = confidence > 0 ? shaktiStyle(model.profile) : 'unknown';
         lastRescueAt = 0;
         lastSeetaAt = 0;
         seetaPending = false;
