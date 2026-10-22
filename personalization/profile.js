@@ -63,6 +63,8 @@ export function defaultProfile() {
     themes: {},              // storm theme -> hit rate
     observations: 0,         // obstacle outcomes seen (drives personalisation fade-in)
     runs: 0,
+    blockGame: 0,            // Rule 2: games played in the current block of PERSONAL_BLOCK
+    blockSlot: 0,            // Rule 2: which game of the current block is personalised
   };
 }
 

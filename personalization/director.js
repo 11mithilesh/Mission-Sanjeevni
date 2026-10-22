@@ -50,6 +50,14 @@ export const FADE_OBSERVATIONS = 250;   // obstacle outcomes until fully persona
 export const CANDIDATES = 24;
 export const VISIBLE_Z = 130;            // roughly where storms emerge from the fog
 export const CLASSIC_SHARE = 0.1;        // share of decisions left classic at full confidence
+// Exactly one Adaptive game in each block of PERSONAL_BLOCK is personalised, at a random
+// position in the block; the rest play like Classic, except that storms and orbs are always
+// personalised (the director still learns from every game).
+// The position is saved with the profile, so the count carries across sessions.
+export const PERSONAL_BLOCK = 30;
+// In a personalised game, play switches to Classic once the score reaches a threshold drawn
+// uniformly within ± CLASSIC_SWITCH_WINDOW of the player's best score (drawn per game).
+export const CLASSIC_SWITCH_WINDOW = 10312;
 // riskMul scales storm risk RELATIVE to the classic proposal: each storm aims at
 // classicRisk × riskMul, and is never placed below riskMul's floor × classicRisk.
 export const LIMITS = {
@@ -134,6 +142,7 @@ export function defaultModel() {
 export function createDirector({
   storage = createStorage({ defaults: defaultModel }), rng = Math.random,
   recorder = createRecorder({ persistSummaries: typeof indexedDB !== 'undefined' }),
+  personalBlock = PERSONAL_BLOCK,
 } = {}) {
   let { model, fresh } = storage.load();
   // Models saved under older limits are pulled into range.
@@ -142,6 +151,7 @@ export function createDirector({
   }
   let tracker = createProfileTracker(model.profile);
   let confidence = 0;
+  let placementConfidence = 0; // confidence before rules 1 and 2: storms and orbs use it
   let tension = 0;
   let brake = 0;
   let struggling = false;  // frozen at run start from the profile's recent run lengths
@@ -150,6 +160,7 @@ export function createDirector({
   let seetaPending = false; // an offered Seeta ring is still in flight
   let style = 'unknown';   // Shakti style, frozen at run start
   let runScore = 0;        // this run's score so far (from tick ctx.score), for the governor
+  let classicAt = null;    // score at which this game switches to Classic (rule 1), or null
   const govBoost = { speedMul: 0, riskMul: 0, gapMul: 0 }; // governor overlay, this run only
   let clock = 0;           // run time as seen by the director
   let sampleTimer = 0;
@@ -161,6 +172,10 @@ export function createDirector({
 
   const D = () => model.director;
   const personalising = () => confidence > 0 && rng() < Math.min(confidence, 1 - CLASSIC_SHARE);
+  // Storms (incl. wall gaps) and orb trails stay personalised in every game: they use the
+  // fade-in confidence, which rules 1 and 2 never switch off.
+  const personalisingPlacement = () =>
+    placementConfidence > 0 && rng() < Math.min(placementConfidence, 1 - CLASSIC_SHARE);
   const learning = () => !model.classic;
 
   function computeConfidence() {
@@ -325,6 +340,7 @@ export function createDirector({
     get seetaPending() { return seetaPending; },
     get shaktiStyle() { return style; },
     get governor() { return governor(); },
+    get classicAt() { return classicAt; },
     // This run's Shakti clears so far: { threat, far }.
     get runClears() { return { threat: run?.clearedThreat ?? 0, far: run?.clearedFar ?? 0 }; },
     get felt() { return felt(); },
@@ -368,7 +384,7 @@ export function createDirector({
       let risk = predictRisk(model.risk, features);
       const classicRisk = risk;
       let personal = false, goal = classicRisk;
-      if (!ctx.fixed && ctx.xRange && personalising()) {
+      if (!ctx.fixed && ctx.xRange && personalisingPlacement()) {
         personal = true;
         // Aim at the classic proposal's risk scaled by riskMul (±5% jitter). The classic spot
         // is the fallback, and no candidate below the floor is ever taken.
@@ -398,7 +414,7 @@ export function createDirector({
     // The classic gap stays unless the controller is pushing harder (riskMul > 1); then the
     // gap whose miss risk is nearest classicRisk × riskMul (never below the floor) is used.
     wallGaps(ctx) {
-      if (!personalising()) return ctx.gaps;
+      if (!personalisingPlacement()) return ctx.gaps;
       const pred = predictShip(model.profile, ctx.ship, arrival(ctx));
       const warning = Math.min(arrival(ctx), VISIBLE_Z / Math.max(ctx.speed, 1));
       const riskOf = (gaps) => {
@@ -468,7 +484,7 @@ export function createDirector({
     // Anchor for a fruit trail, nudged toward lanes the player under-uses.
     // ctx: { x, y (classic proposal), xRange, yRange }
     fruitPath(ctx) {
-      if (!personalising()) return { x: ctx.x, y: ctx.y };
+      if (!personalisingPlacement()) return { x: ctx.x, y: ctx.y };
       const heat = model.profile.heat;
       const max = Math.max(...heat);
       const weights = heat.map((h) => max - h + 0.02);
@@ -517,6 +533,11 @@ export function createDirector({
       if (!ctx.playing) return;
       clock += dt;
       if (ctx.score !== undefined) runScore = ctx.score;
+      if (classicAt !== null && confidence > 0 && runScore >= classicAt) {
+        // Rule 1: from here on this game plays like Classic (storms and orbs stay personalised).
+        confidence = 0;
+        for (const key of Object.keys(govBoost)) govBoost[key] = 0;
+      }
       tension *= Math.exp(-TENSION.decay * dt);
       brake = Math.max(0, brake - dt);
       // Hold the controller until obstacles actually reach the player this run: the empty
@@ -549,6 +570,20 @@ export function createDirector({
       if (e.t === undefined) e.t = clock;
       if (e.type === 'run_start') {
         confidence = computeConfidence();
+        placementConfidence = confidence;
+        // Rule 2: one personalised game per block of `personalBlock`, at a random slot drawn
+        // when each block starts. Only games that could be personalised are counted.
+        if (confidence > 0 && personalBlock > 1) {
+          const p = model.profile;
+          if (p.blockGame === 0 || p.blockSlot >= personalBlock) p.blockSlot = Math.floor(rng() * personalBlock);
+          const personal = p.blockGame === p.blockSlot;
+          p.blockGame = (p.blockGame + 1) % personalBlock;
+          if (!personal) confidence = 0;
+        }
+        // Rule 1: switch this game to Classic at a score drawn within ± the window of the best
+        // score the game passes in (`e.best`); none without a best.
+        classicAt = confidence > 0 && e.best > 0
+          ? Math.max(0, e.best + (rng() * 2 - 1) * CLASSIC_SWITCH_WINDOW) : null;
         struggling = confidence > 0 && isStruggling(model.profile);
         style = confidence > 0 ? shaktiStyle(model.profile) : 'unknown';
         lastRescueAt = 0;
@@ -631,6 +666,7 @@ export function createDirector({
       tracker = createProfileTracker(model.profile);
       fresh = true;
       confidence = 0;
+      placementConfidence = 0;
       tension = 0;
       brake = 0;
       runScore = 0;
@@ -640,7 +676,7 @@ export function createDirector({
     },
     setClassic(on) {
       model.classic = !!on;
-      if (on) confidence = 0;
+      if (on) { confidence = 0; placementConfidence = 0; }
       storage.save(model);
     },
   };

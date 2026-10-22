@@ -12,7 +12,8 @@ function makeDirector({ rng = seeded(1), model = null } = {}) {
   const backend = memoryBackend();
   const storage = createStorage({ defaults: defaultModel, backend });
   if (model) storage.save(model);
-  return createDirector({ storage, rng, recorder: createRecorder() });
+  // Every game personalised (rule 2 off), so these tests exercise personalisation.
+  return createDirector({ storage, rng, recorder: createRecorder(), personalBlock: 1 });
 }
 
 // Today's spawnWave() selection, copied verbatim from the original main.js.

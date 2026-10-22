@@ -19,7 +19,7 @@ const ui = {
   hud: $('hud'), score: $('score'), mult: $('mult'), shield: $('shield'), bestHud: $('best-hud'),
   menu: $('menu'), over: $('over'), pause: $('pause'), start: $('start'), restart: $('restart'),
   resume: $('resume'), finalScore: $('final-score'), finalBest: $('final-best'), newBest: $('new-best'),
-  bestMenu: $('best-menu'), flash: $('flash'), toast: $('toast'), mute: $('mute'),
+  bestMenu: $('best-menu'), flash: $('flash'), toast: $('toast'), hint: $('hint'), mute: $('mute'),
   power: $('power'), powerFill: $('power-fill'),
 };
 
@@ -837,6 +837,18 @@ ship.position.set(0, 3.6, 0);
 ship.visible = false;
 scene.add(ship);
 
+// Light yellow circle around Hanuman while he blinks after a hit. It is a child of the ship,
+// so it blinks with him; it shows only after a hit (not during the start-of-run grace).
+const hitAura = new THREE.Group();
+const auraMaterial = (opacity) => new THREE.MeshBasicMaterial({
+  color: 0xfff1a8, transparent: true, opacity, side: THREE.DoubleSide,
+  blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
+});
+hitAura.add(new THREE.Mesh(new THREE.RingGeometry(1.55, 1.75, 64), auraMaterial(0.9)));
+hitAura.add(new THREE.Mesh(new THREE.CircleGeometry(1.55, 64), auraMaterial(0.12)));
+hitAura.visible = false;
+ship.add(hitAura);
+
 const _v = new THREE.Vector3();
 const ENGINE_LOCAL = new THREE.Vector3(0, 0, -0.9);
 let playerLoaded = false;
@@ -1395,24 +1407,40 @@ const state = {
   invuln: 0,
   shake: 0,
 };
-// Adaptive and Classic keep separate best scores; the displays follow the selected mode.
+// There is no Classic mode switch any more: a player who had turned it on is moved back to
+// the default (personalised play is still limited to 1 game in 30; see the director).
+if (director.model.classic) director.setClassic(false);
 const selectedMode = () => (director.model.classic ? 'classic' : 'adaptive');
-function showBest(mode = selectedMode()) {
-  const best = store.get(mode).toLocaleString();
-  const label = mode === 'classic' ? 'Classic' : 'Adaptive';
+// Scores are still saved per mode, but the game shows one overall best: the higher of both.
+const overallBest = () => Math.max(store.get('adaptive'), store.get('classic'));
+function showBest() {
+  const best = overallBest().toLocaleString();
   ui.bestMenu.textContent = best;
   ui.bestHud.textContent = best;
   ui.finalBest.textContent = best;
-  document.querySelectorAll('.best-mode').forEach((el) => { el.textContent = label; });
 }
 state.runMode = selectedMode();
-state.best = store.get(state.runMode);
+state.best = overallBest();
 showBest();
 
 const multiplier = () => Math.min(8, 1 + Math.floor(state.combo / 4));
 function updatePowerBar() {
   ui.powerFill.style.width = `${(state.powerCharges / 3) * 100}%`;
   ui.power.dataset.level = String(state.powerCharges);
+}
+
+// Once per run, when the first storm comes into view: how to use Shakti.
+const HINT_Z = -130; // roughly where storms emerge from the fog
+let hintShown = false;
+function showHint() {
+  hintShown = true;
+  ui.hint.textContent = 'Click twice to destroy!!';
+  ui.hint.classList.remove('show');
+  void ui.hint.offsetWidth; // restart animation
+  ui.hint.classList.add('show');
+}
+function hideHint() {
+  ui.hint.classList.remove('show');
 }
 
 function toast(text, color) {
@@ -1430,15 +1458,19 @@ function startGame() {
   sfx.start();
   clearEntities();
   gateCount = 0;
-  director.onEvent({ type: 'run_start' }); // fixes this run's personalisation level first
+  // Fixes this run's personalisation level first; `best` sets where it switches to Classic.
+  director.onEvent({ type: 'run_start', best: overallBest() });
   resetRiverStyle();
   nextPlaceIndex = 0;
   showPlaceName();
   nextRiverChange = director.regionInterval();
-  state.runMode = selectedMode(); // a toggle on the game-over panel can't re-file this run
-  state.best = store.get(state.runMode);
-  showBest(state.runMode);
+  state.runMode = selectedMode();
+  state.best = overallBest();
+  showBest();
   Object.assign(state, { mode: 'playing', score: 0, shield: 100, combo: 0, powerCharges: 3, runTime: 0, dist: 0, nextSpawn: 40, invuln: 1, shake: 0 });
+  hintShown = false;
+  hideHint();
+  hitAura.visible = false;
   updatePowerBar();
   ui.power.disabled = false;
   ship.visible = true;
@@ -1456,6 +1488,7 @@ function startGame() {
 function gameOver() {
   state.mode = 'dying';
   ui.power.disabled = true;
+  hideHint();
   burst(ship.position, 160, 16, [2.4, 0.6, 2.2], 1.4);
   burst(ship.position, 80, 9, [0.4, 2.0, 2.6], 1.2);
   ship.visible = false;
@@ -1470,7 +1503,7 @@ function gameOver() {
     state.mode = 'over';
     ui.hud.classList.add('hidden');
     ui.finalScore.textContent = final.toLocaleString();
-    showBest(state.runMode);
+    showBest();
     ui.newBest.classList.toggle('hidden', !isBest);
     ui.over.classList.remove('hidden');
     ui.restart.focus();
@@ -1499,6 +1532,7 @@ function onHit(e) {
   state.shield -= 34;
   state.combo = 0;
   state.invuln = 1.2;
+  hitAura.visible = true;
   state.shake = 0.7;
   burst(e.mesh.position, 70, 12, [2.4, 0.4, 2.0], 0.9);
   sfx.hit();
@@ -1604,25 +1638,6 @@ window.addEventListener('pagehide', () => {
   director.save();
 });
 
-// Classic mode (no personalisation) and Reset learning, shown on the menu and game-over panels.
-const classicToggles = document.querySelectorAll('.classic-mode');
-classicToggles.forEach((box) => {
-  box.checked = director.model.classic;
-  box.addEventListener('change', () => {
-    director.setClassic(box.checked);
-    classicToggles.forEach((other) => { other.checked = box.checked; });
-    showBest();
-  });
-});
-document.querySelectorAll('.reset-learning').forEach((button) => {
-  button.addEventListener('click', () => {
-    if (!confirm('Forget everything the game has learned about how you fly?')) return;
-    director.reset();
-    button.textContent = 'Learning reset ✓';
-    setTimeout(() => { button.textContent = 'Reset learning'; }, 2000);
-  });
-});
-
 ui.start.addEventListener('click', startGame);
 ui.restart.addEventListener('click', startGame);
 ui.resume.addEventListener('click', () => setPaused(false));
@@ -1668,6 +1683,7 @@ function updateShip(dt, t) {
   if (state.invuln > 0) {
     state.invuln -= dt;
     ship.visible = Math.floor(state.invuln * 14) % 2 === 0 || state.invuln <= 0;
+    if (state.invuln <= 0) hitAura.visible = false;
   } else {
     ship.visible = true;
   }
@@ -1692,6 +1708,7 @@ function updateEntities(dt, dz, t) {
 
     if (e.type === 'crystal') {
       m.rotation.y += e.spin * dt;
+      if (playing && !hintShown && zNew - sp.z > HINT_Z) showHint();
       if (playing) {
         const dx = (m.position.x - sp.x) / (e.rx + 1.0);
         const dy = (m.position.y - sp.y) / (e.ry + 0.3);
